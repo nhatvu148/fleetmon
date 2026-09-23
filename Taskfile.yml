@@ -67,7 +67,10 @@ tasks:
     vars:
       OUT: '{{.OUT | default "fleetmon.token"}}'
     cmds:
-      - (umask 077 && ssh root@{{.DEPLOY_SERVER}} 'cat {{.DEPLOY_DIR}}/token' > {{.OUT}})
+      # Task's built-in shell has no `umask`, so restrict the file before any
+      # secret lands in it rather than after.
+      - rm -f '{{.OUT}}' && touch '{{.OUT}}' && chmod 600 '{{.OUT}}'
+      - ssh root@{{.DEPLOY_SERVER}} 'cat {{.DEPLOY_DIR}}/token' > '{{.OUT}}'
       - 'echo "token written to {{.OUT}}"'
 
   deploy:pull:

@@ -5,10 +5,11 @@ services:
     container_name: fleetmon
     restart: unless-stopped
     environment:
-      # Every request arrives from the reverse proxy, so the allowlist is the
-      # proxy's network. The proxy is the real gate for the page; /agent is
-      # gated by the token.
-      FLEETMON_ALLOW: ${FLEETMON_ALLOW:?set FLEETMON_ALLOW to the proxy network CIDR}
+      # The hub's own network, which only it and the reverse proxy join — NOT
+      # the shared proxy network. On that one every other app's container
+      # could reach the hub directly and skip the proxy's auth, so one SSRF
+      # in any of them would expose the page.
+      FLEETMON_ALLOW: ${FLEETMON_SUBNET:?set FLEETMON_SUBNET}
       FLEETMON_TOKEN_FILE: /run/secrets/fleetmon-token
     volumes:
       # Created by `task deploy:token`, owned by the image's nonroot uid.
@@ -17,10 +18,14 @@ services:
     # leak here from starving everything else on a shared box.
     mem_limit: 64m
     memswap_limit: 64m
-    # No published port: the reverse proxy reaches it by container name.
+    # No published port: the reverse proxy reaches it by container name, after
+    # joining this network (see docs/deploy.md).
     networks:
-      - proxy-network
+      - fleetmon
 
 networks:
-  proxy-network:
-    external: true
+  fleetmon:
+    name: fleetmon
+    ipam:
+      config:
+        - subnet: ${FLEETMON_SUBNET:?set FLEETMON_SUBNET}

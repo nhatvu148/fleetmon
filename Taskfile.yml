@@ -76,13 +76,13 @@ tasks:
     cmds:
       - ssh root@{{.DEPLOY_SERVER}} 'mkdir -p {{.DEPLOY_DIR}}'
       - scp docker/docker-compose.prod.yml root@{{.DEPLOY_SERVER}}:{{.DEPLOY_DIR}}/
-      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && docker compose -f docker-compose.prod.yml pull'
+      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && FLEETMON_SUBNET={{.FLEETMON_SUBNET}} docker compose -f docker-compose.prod.yml pull'
 
   deploy:start:
     desc: Start or restart the container via compose
     cmds:
       - ssh root@{{.DEPLOY_SERVER}} 'test -s {{.DEPLOY_DIR}}/token || { echo "no token; run task deploy:token"; exit 1; }'
-      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && FLEETMON_ALLOW={{.FLEETMON_ALLOW}} docker compose -f docker-compose.prod.yml up -d'
+      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && FLEETMON_SUBNET={{.FLEETMON_SUBNET}} docker compose -f docker-compose.prod.yml up -d'
       - ssh root@{{.DEPLOY_SERVER}} 'sleep 3; docker ps --filter name=^fleetmon$ --format "{{"{{"}}.Status{{"}}"}}"; docker logs --tail 5 fleetmon'
 
   deploy:logs:
@@ -93,7 +93,7 @@ tasks:
   deploy:down:
     desc: Stop and remove the container on the server
     cmds:
-      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && docker compose -f docker-compose.prod.yml down'
+      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && FLEETMON_SUBNET={{.FLEETMON_SUBNET}} docker compose -f docker-compose.prod.yml down'
 
   deploy:
     desc: Full deploy — preflight, pull from GHCR, restart

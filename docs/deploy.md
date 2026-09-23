@@ -1,13 +1,17 @@
 # Deploying the hub behind a reverse proxy
 
-This is how the hub runs on a shared box: a container on a docker network the reverse proxy also sits on, a CDN in front terminating TLS, and the proxy routing by host name. Agents connect to `wss://<domain>/agent`.
+This is how the hub runs on a shared box: a container on its own small docker network, which the reverse proxy also joins, a CDN in front terminating TLS, and the proxy routing by host name. Agents connect to `wss://<domain>/agent`.
+
+The network is deliberately not the proxy's shared one. There, every other app's container could reach `fleetmon:7070` directly and skip the proxy's auth — so a single SSRF anywhere on the box would expose the page. On a network of two, the hub's allowlist (the subnet) admits only the proxy.
 
 ## One-time
 
 1. `cp .env.deploy.example .env.deploy` and fill it in.
 2. DNS: a proxied record for the domain pointing at the box.
 3. `task deploy:token` — creates the agent token on the server, owned by the container's user, never printed.
-4. Add a server block to the reverse proxy (below) and reload it.
+4. `task deploy` once, which creates the `fleetmon` network.
+5. Join the reverse proxy to it — live with `docker network connect fleetmon <proxy-container>`, and persistently by adding it to the proxy's compose file as an external network.
+6. Add a server block to the reverse proxy (below) and reload it.
 
 ## Each release
 
@@ -58,8 +62,6 @@ server {
     }
 }
 ```
-
-The hub's `FLEETMON_ALLOW` is the proxy network's CIDR, since every request reaches it from the proxy. That keeps the hub unreachable from anything else on the box that is not on that network.
 
 ## Pointing an agent at it
 

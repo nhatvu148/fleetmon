@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Linux runs the full suite: sysinfo and the e2e test are portable, and the
+  # hub is expected to live on any box.
+  linux:
+    uses: nhatvu148/shared-workflows/.github/workflows/rust-ci.yml@v2
+    with:
+      components: clippy, rustfmt
+      commands: |
+        cargo fmt --all --check
+        cargo clippy --all-targets -- -D warnings
+        cargo test --all
+
+  # The agent's main target is Windows, where sysinfo takes a different code
+  # path entirely. Test it there rather than assume.
+  windows:
+    uses: nhatvu148/shared-workflows/.github/workflows/rust-ci.yml@v2
+    with:
+      runner: '"windows-latest"'
+      cache-key: windows
+      commands: |
+        cargo test --all

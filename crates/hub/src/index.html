@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fleetmon</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #1b1f24; --muted: #6b7280; --line: #e5e7eb;
+    --cpu: #2563eb; --mem: #d97706; --ok: #16a34a; --off: #9ca3af; --hot: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #171a21; --fg: #e6e8eb; --muted: #8b93a1; --line: #262b35;
+      --cpu: #60a5fa; --mem: #fbbf24; --ok: #4ade80; --off: #4b5563; --hot: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  #status { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 0 16px 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .card.off { opacity: .55; }
+  .top { display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+  .off .dot { background: var(--off); }
+  .name { font-weight: 600; font-size: 15px; }
+  .sub { color: var(--muted); font-size: 12px; margin: 2px 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row { display: grid; grid-template-columns: 40px 1fr 88px; align-items: center; gap: 8px; margin: 6px 0; }
+  .row .k { color: var(--muted); font-size: 12px; }
+  .row .v { text-align: right; font-variant-numeric: tabular-nums; }
+  canvas { width: 100%; height: 36px; display: block; }
+  .net { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; font-variant-numeric: tabular-nums; }
+  td { padding: 2px 0; border-top: 1px solid var(--line); }
+  td.n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 0; width: 60%; }
+  td.r { text-align: right; color: var(--muted); }
+  .empty { color: var(--muted); padding: 16px; }
+</style>
+</head>
+<body>
+<header><h1>fleetmon</h1><span id="status">connecting…</span></header>
+<main id="grid"><div class="empty">No agents yet.</div></main>
+<script>
+const hosts = new Map(); // name -> {info, online, history[]}
+let limit = 300;
+const grid = document.getElementById('grid');
+const status = document.getElementById('status');
+
+const gb = b => (b / 1073741824).toFixed(1);
+const rate = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB/s' : (b / 1024).toFixed(0) + ' KB/s';
+const dur = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600); return d ? `${d}d ${h}h` : `${h}h ${Math.floor(s % 3600 / 60)}m`; };
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function card(name) {
+  let el = document.getElementById('h-' + name);
+  if (!el) {
+    el = document.createElement('section');
+    el.className = 'card';
+    el.id = 'h-' + name;
+    el.innerHTML = `<div class="top"><span class="dot"></span><span class="name"></span></div>
+      <div class="sub"></div>
+      <div class="row"><span class="k">CPU</span><canvas data-k="cpu"></canvas><span class="v" data-v="cpu"></span></div>
+      <div class="row"><span class="k">Mem</span><canvas data-k="mem"></canvas><span class="v" data-v="mem"></span></div>
+      <div class="net"></div><table></table>`;
+    el.querySelector('.name').textContent = name;
+    const cards = [...grid.querySelectorAll('.card')];
+    const after = cards.find(c => c.id > el.id);
+    grid.querySelector('.empty')?.remove();
+    grid.insertBefore(el, after || null);
+  }
+  return el;
+}
+
+function spark(canvas, values, color) {
+  const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const g = canvas.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  if (values.length < 2) return;
+  const step = w / (limit - 1), x0 = w - (values.length - 1) * step;
+  g.beginPath();
+  values.forEach((v, i) => { const x = x0 + i * step, y = h - (v / 100) * (h - 2) - 1; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.strokeStyle = color; g.lineWidth = 1.5; g.stroke();
+  g.lineTo(w, h); g.lineTo(x0, h); g.closePath();
+  g.globalAlpha = .15; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
+}
+
+function render(name) {
+  const h = hosts.get(name), el = card(name), css = getComputedStyle(document.documentElement);
+  el.classList.toggle('off', !h.online);
+  el.querySelector('.sub').textContent = `${h.info.os} · ${h.info.cores}c ${h.info.cpu_model}`;
+  const last = h.history[h.history.length - 1];
+  const memPct = s => s.mem_used / h.info.mem_total * 100;
+  spark(el.querySelector('[data-k=cpu]'), h.history.map(s => s.cpu_pct), css.getPropertyValue('--cpu'));
+  spark(el.querySelector('[data-k=mem]'), h.history.map(memPct), css.getPropertyValue('--mem'));
+  if (!last) return;
+  const cpuV = el.querySelector('[data-v=cpu]');
+  cpuV.textContent = last.cpu_pct.toFixed(0) + '%';
+  cpuV.style.color = last.cpu_pct > 85 ? 'var(--hot)' : '';
+  el.querySelector('[data-v=mem]').textContent = `${gb(last.mem_used)}/${gb(h.info.mem_total)}G`;
+  el.querySelector('.net').textContent = `↓ ${rate(last.net_rx_bps)}  ↑ ${rate(last.net_tx_bps)}  · up ${dur(last.uptime_s)}`;
+  el.querySelector('table').innerHTML = last.top.map(p =>
+    `<tr><td class="n">${esc(p.name)}</td><td class="r">${p.cpu_pct.toFixed(1)}%</td><td class="r">${(p.mem / 1048576).toFixed(0)} MB</td></tr>`).join('');
+}
+
+function onMsg(m) {
+  switch (m.type) {
+    case 'snapshot':
+      hosts.clear(); grid.innerHTML = '';
+      if (!m.hosts.length) grid.innerHTML = '<div class="empty">No agents yet.</div>';
+      for (const h of m.hosts) { hosts.set(h.info.name, h); limit = Math.max(limit, h.history.length); render(h.info.name); }
+      break;
+    case 'host': {
+      const h = hosts.get(m.info.name) || { history: [] };
+      hosts.set(m.info.name, { ...h, info: m.info, online: true });
+      render(m.info.name);
+      break;
+    }
+    case 'sample': {
+      const h = hosts.get(m.host); if (!h) return;
+      h.history.push(m.sample);
+      if (h.history.length > limit) h.history.shift();
+      render(m.host);
+      break;
+    }
+    case 'offline': {
+      const h = hosts.get(m.host); if (!h) return;
+      h.online = false; render(m.host);
+      break;
+    }
+    case 'removed':
+      hosts.delete(m.host);
+      document.getElementById('h-' + m.host)?.remove();
+      if (!hosts.size) grid.innerHTML = '<div class="empty">No agents yet.</div>';
+      break;
+  }
+}
+
+let backoff = 500;
+function connect() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.onopen = () => { backoff = 500; status.textContent = 'live'; };
+  ws.onmessage = e => onMsg(JSON.parse(e.data));
+  ws.onclose = () => {
+    status.textContent = 'hub unreachable — retrying';
+    setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 10000);
+  };
+}
+connect();
+</script>
+</body>
+</html>

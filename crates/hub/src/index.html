@@ -7,76 +7,152 @@
 <link rel="icon" href="data:,">
 <style>
   :root {
-    --bg: #f6f7f9; --card: #fff; --fg: #1b1f24; --muted: #6b7280; --line: #e5e7eb;
-    --cpu: #2563eb; --mem: #d97706; --ok: #16a34a; --off: #9ca3af; --hot: #dc2626;
+    color-scheme: light;
+    --bg: #f6f7f9; --card: #fff; --inset: #f1f3f6; --fg: #1b1f24; --muted: #6b7280; --line: #e5e7eb;
+    /* Chart series, from a palette validated for colour-vision deficiency in
+       both themes. Slots 1 and 2 are the only pair any chart puts side by side. */
+    --s1: #2a78d6; --s2: #eb6834;
+    --ok: #0ca30c; --warn: #b87800; --hot: #d93b3b; --off: #9ca3af;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0f1115; --card: #171a21; --fg: #e6e8eb; --muted: #8b93a1; --line: #262b35;
-      --cpu: #60a5fa; --mem: #fbbf24; --ok: #4ade80; --off: #4b5563; --hot: #f87171;
+      color-scheme: dark;
+      --bg: #0f1115; --card: #171a21; --inset: #1d212a; --fg: #e6e8eb; --muted: #8b93a1; --line: #262b35;
+      --s1: #3987e5; --s2: #d95926;
+      --ok: #0ca30c; --warn: #fab219; --hot: #f16b6b; --off: #4b5563;
     }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
-  header { display: flex; align-items: baseline; gap: 12px; padding: 16px; }
+  a { color: inherit; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 16px; flex-wrap: wrap; }
   h1 { font-size: 18px; margin: 0; }
+  h1 a { text-decoration: none; }
   #status { color: var(--muted); font-size: 12px; }
-  main { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 0 16px 16px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
-  .card.off { opacity: .55; }
+  .num { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  .off { opacity: .55; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; display: inline-block; }
+  .off .dot, .dot.off { background: var(--off); }
+  .empty { color: var(--muted); padding: 16px; }
+
+  /* ---- overview ---- */
+  #overview { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 0 16px 16px; }
+  #overview .card { cursor: pointer; transition: border-color .15s; }
+  #overview .card:hover, #overview .card:focus-visible { border-color: var(--s1); outline: none; }
   .top { display: flex; align-items: center; gap: 8px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
-  .off .dot { background: var(--off); }
-  .name { font-weight: 600; font-size: 15px; }
+  .name { font-weight: 600; font-size: 15px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .more { font-size: 12px; color: var(--muted); }
   .sub { color: var(--muted); font-size: 12px; margin: 2px 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row { display: grid; grid-template-columns: 40px 1fr 88px; align-items: center; gap: 8px; margin: 6px 0; }
   .row .k { color: var(--muted); font-size: 12px; }
-  .row .v { text-align: right; font-variant-numeric: tabular-nums; }
-  canvas { width: 100%; height: 36px; display: block; }
-  .net { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 4px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; font-variant-numeric: tabular-nums; }
-  td { padding: 2px 0; border-top: 1px solid var(--line); }
-  td.n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 0; width: 60%; }
-  td.r { text-align: right; color: var(--muted); }
-  .empty { color: var(--muted); padding: 16px; }
+  .row .v { text-align: right; }
+  .row canvas { width: 100%; height: 36px; display: block; }
+  .facts { color: var(--muted); font-size: 12px; margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td, th { padding: 3px 0; border-top: 1px solid var(--line); text-align: left; font-weight: normal; }
+  th { color: var(--muted); border-top: 0; }
+  td.n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 0; width: 55%; }
+  td.r, th.r { text-align: right; }
+  td.r { color: var(--muted); }
+  .card > table { margin-top: 10px; }
+
+  /* ---- detail ---- */
+  #detail { padding: 0 16px 24px; display: grid; gap: 16px; }
+  .title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .title h2 { margin: 0; font-size: 20px; }
+  .title .back { margin-left: auto; font-size: 13px; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 6px 8px; }
+  .chip { padding: 4px 12px; border-right: 1px solid var(--line); white-space: nowrap; font-size: 13px; }
+  .chip:last-child { border-right: 0; }
+  .chip b { font-weight: 600; margin-left: 6px; }
+  .cols3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+  .cols2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  h3 { margin: 0 0 8px; font-size: 14px; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+  .panel-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+  .panel-head h3 { margin: 0; font-weight: 500; color: var(--muted); }
+  .big { font-size: 20px; font-weight: 600; }
+  .legend { margin-left: auto; display: flex; gap: 12px; font-size: 12px; color: var(--muted); }
+  .sw { display: inline-block; width: 10px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+  .chart { position: relative; }
+  .chart canvas { width: 100%; height: 170px; display: block; touch-action: none; }
+  .tip { position: absolute; top: 4px; pointer-events: none; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / .15); }
+  .tip strong { font-weight: 600; }
+  .cores { display: grid; grid-template-columns: repeat(auto-fit, minmax(34px, 1fr)); gap: 6px; }
+  .core { display: grid; gap: 3px; justify-items: center; font-size: 11px; color: var(--muted); }
+  .core .bar { width: 100%; height: 80px; background: var(--inset); border-radius: 4px; position: relative; overflow: hidden; }
+  .core .fill { position: absolute; left: 0; right: 0; bottom: 0; background: var(--s1); border-radius: 4px 4px 0 0; }
+  .meter { height: 8px; background: var(--inset); border-radius: 4px; overflow: hidden; }
+  .meter > div { height: 100%; background: var(--s1); border-radius: 4px; }
+  .meter.warn > div { background: var(--warn); }
+  .meter.hot > div { background: var(--hot); }
+  .item { display: grid; gap: 4px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
+  .item:first-child { border-top: 0; }
+  .item .line { display: flex; gap: 8px; justify-content: space-between; }
+  .flag { font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 4px; border: 1px solid currentColor; }
+  .flag.hot { color: var(--hot); }
+  .flag.warn { color: var(--warn); }
+  .note { font-size: 13px; color: var(--muted); background: var(--inset); border-radius: 8px; padding: 10px 12px; }
+  [hidden] { display: none !important; }
+  @media (max-width: 900px) {
+    .cols3, .cols2 { grid-template-columns: minmax(0, 1fr); }
+  }
 </style>
 </head>
 <body>
-<header><h1>fleetmon</h1><span id="status">connecting…</span></header>
-<main id="grid"><div class="empty">No agents yet.</div></main>
+<header><h1><a href="#">fleetmon</a></h1><span id="status">connecting…</span></header>
+<main id="overview"><div class="empty">No agents yet.</div></main>
+<main id="detail" hidden></main>
 <script>
-const hosts = new Map(); // name -> {info, online, history[]}
+'use strict';
+const hosts = new Map(); // name -> {info, online, history[] (slim), latest}
 let limit = 300;
-const grid = document.getElementById('grid');
+const overview = document.getElementById('overview');
+const detail = document.getElementById('detail');
 const status = document.getElementById('status');
 
-const gb = b => (b / 1073741824).toFixed(1);
-const rate = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB/s' : (b / 1024).toFixed(0) + ' KB/s';
-const dur = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600); return d ? `${d}d ${h}h` : `${h}h ${Math.floor(s % 3600 / 60)}m`; };
-const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+// ---------------------------------------------------------------- formatting
+const GB = 1073741824, MB = 1048576;
+const gb = b => (b / GB).toFixed(1);
+const size = b => b >= 1e12 ? (b / 1099511627776).toFixed(2) + ' TB' : b >= GB ? (b / GB).toFixed(1) + ' GB' : (b / MB).toFixed(0) + ' MB';
+const trim1 = v => v.toFixed(1).replace(/\.0$/, '');
+const rate = b => b >= MB ? trim1(b / MB) + ' MB/s' : b >= 1024 ? (b / 1024).toFixed(0) + ' KB/s' : Math.round(b) + ' B/s';
+const pct = v => (v == null ? '—' : v.toFixed(0) + '%');
+const dur = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
+const clock = ms => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const level = (v, warn, hot) => v >= hot ? 'hot' : v >= warn ? 'warn' : '';
 
-function card(name) {
-  let el = document.getElementById('h-' + name);
-  if (!el) {
-    el = document.createElement('section');
-    el.className = 'card';
-    el.id = 'h-' + name;
-    el.innerHTML = `<div class="top"><span class="dot"></span><span class="name"></span></div>
-      <div class="sub"></div>
-      <div class="row"><span class="k">CPU</span><canvas data-k="cpu"></canvas><span class="v" data-v="cpu"></span></div>
-      <div class="row"><span class="k">Mem</span><canvas data-k="mem"></canvas><span class="v" data-v="mem"></span></div>
-      <div class="net"></div><table></table>`;
-    el.querySelector('.name').textContent = name;
-    const cards = [...grid.querySelectorAll('.card')];
-    const after = cards.find(c => c.id > el.id);
-    grid.querySelector('.empty')?.remove();
-    grid.insertBefore(el, after || null);
+// Every string from an agent goes through text nodes: process names and
+// sensor labels come from other machines and are not HTML.
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k === 'style') e.style.cssText = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? '' : v);
   }
-  return el;
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k instanceof Node ? k : String(k));
+  return e;
 }
 
-function spark(canvas, values, color) {
+// The history keeps the scalars charts plot; lists live only on `latest`.
+function slim(s) {
+  const { top, top_mem, cpu_cores, disks, ifaces, temps, ...rest } = s;
+  return rest;
+}
+const hasDetail = h => h.latest && (h.latest.cpu_cores || []).length > 0;
+
+// ---------------------------------------------------------------- sparkline (overview)
+function spark(canvas, values, color, max = 100) {
   const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w) return;
   if (canvas.width !== w * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
   const g = canvas.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -84,59 +160,351 @@ function spark(canvas, values, color) {
   if (values.length < 2) return;
   const step = w / (limit - 1), x0 = w - (values.length - 1) * step;
   g.beginPath();
-  values.forEach((v, i) => { const x = x0 + i * step, y = h - (v / 100) * (h - 2) - 1; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  values.forEach((v, i) => { const x = x0 + i * step, y = h - (Math.min(v, max) / max) * (h - 2) - 1; i ? g.lineTo(x, y) : g.moveTo(x, y); });
   g.strokeStyle = color; g.lineWidth = 1.5; g.stroke();
   g.lineTo(w, h); g.lineTo(x0, h); g.closePath();
   g.globalAlpha = .15; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
 }
 
-function render(name) {
-  const h = hosts.get(name), el = card(name), css = getComputedStyle(document.documentElement);
-  el.classList.toggle('off', !h.online);
-  el.querySelector('.sub').textContent = `${h.info.os} · ${h.info.cores}c ${h.info.cpu_model}`;
+// ---------------------------------------------------------------- charts (detail)
+// A 1-2-5 ceiling, so axis labels are round numbers. `unit` is the size the
+// labels are printed in (1024 for byte rates), so rounding happens in the units
+// the reader sees — otherwise a round number of bytes prints as "76.8 MB/s".
+function niceMax(v, unit = 1) {
+  if (!(v > 0)) return 1;
+  let base = 1;
+  if (unit > 1) while (v / (base * unit) >= 1) base *= unit;
+  const x = v / base, p = Math.pow(10, Math.floor(Math.log10(x))), f = x / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p * base;
+}
+
+// spec: {times, series: [{label, color, values}], fmt, max?}. One y-axis only.
+function drawChart(canvas, spec, hoverX) {
+  const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w) return null;
+  if (canvas.width !== w * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const g = canvas.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const padL = 68, padR = 8, padT = 8, padB = 20, pw = w - padL - padR, ph = h - padT - padB;
+  const all = spec.series.flatMap(s => s.values).filter(v => v != null);
+  const max = spec.max != null ? spec.max : niceMax(Math.max(0, ...all) * 1.1, spec.unit);
+  const muted = css('--muted'), line = css('--line');
+
+  g.font = '11px system-ui, sans-serif';
+  g.fillStyle = muted; g.textAlign = 'right'; g.textBaseline = 'middle';
+  for (let i = 0; i <= 2; i++) {
+    const v = max * i / 2, y = padT + ph - (v / max) * ph;
+    g.strokeStyle = line; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(padL, Math.round(y) + .5); g.lineTo(w - padR, Math.round(y) + .5); g.stroke();
+    g.fillText(spec.fmt(v), padL - 6, y);
+  }
+  g.textBaseline = 'alphabetic';
+  g.textAlign = 'left'; g.fillText(`−${Math.round(limit / 60)} min`, padL, h - 4);
+  g.textAlign = 'right'; g.fillText('now', w - padR, h - 4);
+
+  const n = spec.times.length;
+  if (n < 2) return null;
+  const step = pw / (limit - 1), x0 = padL + pw - (n - 1) * step;
+  const X = i => x0 + i * step, Y = v => padT + ph - (Math.min(v, max) / max) * ph;
+  for (const s of spec.series) {
+    g.beginPath(); let started = false;
+    s.values.forEach((v, i) => { if (v == null) { started = false; return; } started ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)); started = true; });
+    g.strokeStyle = s.color; g.lineWidth = 2; g.lineJoin = 'round'; g.stroke();
+    if (spec.series.length === 1) {
+      g.lineTo(X(n - 1), padT + ph); g.lineTo(X(0), padT + ph); g.closePath();
+      g.globalAlpha = .12; g.fillStyle = s.color; g.fill(); g.globalAlpha = 1;
+    }
+  }
+
+  if (hoverX == null) return null;
+  const i = Math.max(0, Math.min(n - 1, Math.round((hoverX - x0) / step)));
+  const x = X(i);
+  g.strokeStyle = muted; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(Math.round(x) + .5, padT); g.lineTo(Math.round(x) + .5, padT + ph); g.stroke();
+  const card = css('--card');
+  for (const s of spec.series) {
+    const v = s.values[i]; if (v == null) continue;
+    g.beginPath(); g.arc(x, Y(v), 4, 0, Math.PI * 2);
+    g.fillStyle = s.color; g.fill(); g.lineWidth = 2; g.strokeStyle = card; g.stroke();
+  }
+  return { i, x };
+}
+
+// A panel owns its canvas, tooltip and hover state, so the redraw every second
+// keeps the crosshair where the pointer is.
+function chartPanel(title) {
+  const big = el('span', { class: 'big num' });
+  const legend = el('span', { class: 'legend' });
+  const canvas = el('canvas', { role: 'img' });
+  const tip = el('div', { class: 'tip', hidden: true });
+  const wrap = el('div', { class: 'chart' }, canvas, tip);
+  const root = el('section', { class: 'card' }, el('div', { class: 'panel-head' }, el('h3', {}, title), big, legend), wrap);
+  const panel = { root, spec: null, hoverX: null };
+  const draw = () => {
+    if (!panel.spec) return;
+    const hit = drawChart(canvas, panel.spec, panel.hoverX);
+    if (!hit) { tip.hidden = true; return; }
+    tip.replaceChildren(el('div', { class: 'muted' }, clock(panel.spec.times[hit.i])),
+      ...panel.spec.series.map(s => el('div', {}, el('span', { class: 'sw', style: `background:${s.color}` }),
+        el('strong', { class: 'num' }, s.values[hit.i] == null ? '—' : panel.spec.fmt(s.values[hit.i])), ' ', s.label)));
+    tip.hidden = false;
+    const tw = tip.offsetWidth, cw = canvas.clientWidth;
+    tip.style.left = (hit.x + 12 + tw > cw ? hit.x - 12 - tw : hit.x + 12) + 'px';
+  };
+  canvas.addEventListener('pointermove', e => { panel.hoverX = e.offsetX; draw(); });
+  canvas.addEventListener('pointerleave', () => { panel.hoverX = null; draw(); });
+  panel.update = (spec, headline) => {
+    panel.spec = spec;
+    big.textContent = headline;
+    canvas.setAttribute('aria-label', `${title}: ${headline}`);
+    legend.replaceChildren(...(spec.series.length > 1 ? spec.series.map(s =>
+      el('span', {}, el('span', { class: 'sw', style: `background:${s.color}` }), s.label)) : []));
+    draw();
+  };
+  return panel;
+}
+
+// ---------------------------------------------------------------- overview
+const openHost = name => { location.hash = 'host/' + encodeURIComponent(name); };
+
+function card(name) {
+  let c = document.getElementById('h-' + name);
+  if (c) return c;
+  c = el('section', { class: 'card', id: 'h-' + name, tabindex: 0, role: 'link',
+    onclick: () => openHost(name), onkeydown: e => { if (e.key === 'Enter') openHost(name); } },
+    el('div', { class: 'top' }, el('span', { class: 'dot' }), el('span', { class: 'name' }, name), el('span', { class: 'more' }, 'Details →')),
+    el('div', { class: 'sub' }),
+    el('div', { class: 'row' }, el('span', { class: 'k' }, 'CPU'), el('canvas', { 'data-k': 'cpu' }), el('span', { class: 'v num', 'data-v': 'cpu' })),
+    el('div', { class: 'row' }, el('span', { class: 'k' }, 'Mem'), el('canvas', { 'data-k': 'mem' }), el('span', { class: 'v num', 'data-v': 'mem' })),
+    el('div', { class: 'facts num' }), el('table'));
+  overview.querySelector('.empty')?.remove();
+  const after = [...overview.querySelectorAll('.card')].find(x => x.id > c.id);
+  overview.insertBefore(c, after || null);
+  return c;
+}
+
+function renderCard(name) {
+  const h = hosts.get(name), c = card(name);
+  c.classList.toggle('off', !h.online);
+  c.querySelector('.sub').textContent = `${h.info.os} · ${h.info.cores}c ${h.info.cpu_model}`;
   const last = h.history[h.history.length - 1];
-  const memPct = s => s.mem_used / h.info.mem_total * 100;
-  spark(el.querySelector('[data-k=cpu]'), h.history.map(s => s.cpu_pct), css.getPropertyValue('--cpu'));
-  spark(el.querySelector('[data-k=mem]'), h.history.map(memPct), css.getPropertyValue('--mem'));
+  spark(c.querySelector('[data-k=cpu]'), h.history.map(s => s.cpu_pct), css('--s1'));
+  spark(c.querySelector('[data-k=mem]'), h.history.map(s => s.mem_used / h.info.mem_total * 100), css('--s2'));
   if (!last) return;
-  const cpuV = el.querySelector('[data-v=cpu]');
-  cpuV.textContent = last.cpu_pct.toFixed(0) + '%';
-  cpuV.style.color = last.cpu_pct > 85 ? 'var(--hot)' : '';
-  el.querySelector('[data-v=mem]').textContent = `${gb(last.mem_used)}/${gb(h.info.mem_total)}G`;
-  el.querySelector('.net').textContent = `↓ ${rate(last.net_rx_bps)}  ↑ ${rate(last.net_tx_bps)}  · up ${dur(last.uptime_s)}`;
-  el.querySelector('table').innerHTML = last.top.map(p =>
-    `<tr><td class="n">${esc(p.name)}</td><td class="r">${p.cpu_pct.toFixed(1)}%</td><td class="r">${(p.mem / 1048576).toFixed(0)} MB</td></tr>`).join('');
+  c.querySelector('[data-v=cpu]').textContent = pct(last.cpu_pct);
+  c.querySelector('[data-v=mem]').textContent = `${gb(last.mem_used)}/${gb(h.info.mem_total)}G`;
+  const L = h.latest || {};
+  const disk = (L.disks || [])[0];
+  const facts = [`↓ ${rate(last.net_rx_bps)}`, `↑ ${rate(last.net_tx_bps)}`];
+  if (disk) facts.push(`disk ${pct((disk.total - disk.available) / disk.total * 100)}`);
+  if (last.temp_max_c != null) facts.push(`${last.temp_max_c.toFixed(0)}°C`);
+  if (last.load_avg) facts.push(`load ${last.load_avg[0].toFixed(1)}`);
+  if (last.proc_count) facts.push(`${last.proc_count} procs`);
+  facts.push(`up ${dur(last.uptime_s)}`);
+  c.querySelector('.facts').replaceChildren(...facts.map(f => el('span', {}, f)));
+  c.querySelector('table').replaceChildren(...(L.top || []).map(p =>
+    el('tr', {}, el('td', { class: 'n' }, p.name), el('td', { class: 'r num' }, p.cpu_pct.toFixed(1) + '%'), el('td', { class: 'r num' }, size(p.mem)))));
+}
+
+// ---------------------------------------------------------------- detail
+let view = null; // {name, panels, parts} while a host is open
+
+function openDetail(name) {
+  const sec = (t, ...kids) => el('section', { class: 'card' }, el('h3', {}, t), ...kids);
+  const parts = {
+    title: el('div', { class: 'title' }),
+    chips: el('div', { class: 'chips num' }),
+    note: el('div', { class: 'note', hidden: true }, 'This agent is version 0.1, which reports only the basics. Update it to 0.2 or later for per-core CPU, disks, sensors, interfaces and processes by memory.'),
+    sys: el('dl'), mem: el('dl'), net: el('dl'),
+    cores: el('div', { class: 'cores' }), disks: el('div'), temps: el('div'),
+    procCpu: el('table'), procMem: el('table'), procCount: el('span', { class: 'muted num' }),
+  };
+  parts.coresSec = sec('Per-core CPU', parts.cores);
+  parts.disksSec = sec('Storage', parts.disks);
+  parts.tempsSec = sec('Sensors', parts.temps);
+  const panels = { cpu: chartPanel('CPU'), mem: chartPanel('Memory'), net: chartPanel('Network'),
+    disk: chartPanel('Disk I/O'), temp: chartPanel('Temperature'), load: chartPanel('Load average') };
+  detail.replaceChildren(
+    parts.title, parts.chips, parts.note,
+    el('div', { class: 'cols3' }, sec('System', parts.sys), sec('Memory', parts.mem), sec('Network', parts.net)),
+    el('div', { class: 'cols2' }, ...Object.values(panels).map(p => p.root)),
+    parts.coresSec,
+    el('div', { class: 'cols2' }, parts.disksSec, parts.tempsSec),
+    el('div', { class: 'cols2' },
+      el('section', { class: 'card' }, el('div', { class: 'panel-head' }, el('h3', {}, 'Top by CPU'), parts.procCount), parts.procCpu),
+      parts.procMemSec = sec('Top by memory', parts.procMem)));
+  view = { name, panels, parts };
+  renderDetail();
+}
+
+function kv(dl, pairs) {
+  dl.replaceChildren(...pairs.filter(p => p[1] != null && p[1] !== '')
+    .flatMap(([k, v]) => [el('dt', {}, k), el('dd', { class: 'num' }, v)]));
+}
+
+function procTable(tbl, rows) {
+  tbl.replaceChildren(el('tr', {}, el('th', {}, 'Process'), el('th', { class: 'r' }, 'CPU'), el('th', { class: 'r' }, 'Memory')),
+    ...rows.map(p => el('tr', {}, el('td', { class: 'n', title: `pid ${p.pid}` }, p.name),
+      el('td', { class: 'r num' }, p.cpu_pct.toFixed(1) + '%'), el('td', { class: 'r num' }, size(p.mem)))));
+}
+
+function renderDetail() {
+  if (!view) return;
+  const h = hosts.get(view.name);
+  if (!h) { detail.replaceChildren(el('div', { class: 'empty' }, `No machine called “${view.name}”. `, el('a', { href: '#' }, 'All machines'))); view = null; return; }
+  const { panels, parts } = view, info = h.info, hist = h.history;
+  const L = h.latest || hist[hist.length - 1] || {}, rich = hasDetail(h);
+  const times = hist.map(s => s.ts_ms);
+
+  parts.title.replaceChildren(el('span', { class: 'dot' + (h.online ? '' : ' off') }), el('h2', {}, info.name),
+    el('span', { class: 'muted' }, h.online ? `${info.os} · ${info.cpu_model}` : 'offline'),
+    el('a', { class: 'back', href: '#' }, '← All machines'));
+  parts.note.hidden = rich || !h.latest;
+
+  const memPct = L.mem_used != null ? L.mem_used / info.mem_total * 100 : null;
+  const chips = [
+    ['CPU', pct(L.cpu_pct)],
+    ['Memory', L.mem_used != null ? `${gb(L.mem_used)} / ${gb(info.mem_total)} GB` : '—'],
+    L.swap_total ? ['Swap', `${gb(L.swap_used)} / ${gb(L.swap_total)} GB`] : null,
+    ['Net', L.net_rx_bps != null ? `↓ ${rate(L.net_rx_bps)}  ↑ ${rate(L.net_tx_bps)}` : '—'],
+    rich ? ['Disk', `R ${rate(L.disk_read_bps)}  W ${rate(L.disk_write_bps)}`] : null,
+    L.temp_max_c != null ? ['Hottest', `${L.temp_max_c.toFixed(1)} °C`] : null,
+    L.load_avg ? ['Load', L.load_avg.map(v => v.toFixed(2)).join('  ')] : null,
+    L.proc_count ? ['Processes', L.proc_count] : null,
+    L.uptime_s != null ? ['Up', dur(L.uptime_s)] : null,
+  ].filter(Boolean);
+  parts.chips.replaceChildren(...chips.map(([k, v]) => el('span', { class: 'chip' }, el('span', { class: 'muted' }, k), el('b', {}, v))));
+
+  kv(parts.sys, [
+    ['OS', info.os], ['Kernel', info.kernel], ['Architecture', info.arch], ['CPU', info.cpu_model],
+    ['Cores', info.physical_cores && info.physical_cores !== info.cores ? `${info.cores} logical · ${info.physical_cores} physical` : `${info.cores}`],
+    ['Clock', L.cpu_freq_mhz ? `${(L.cpu_freq_mhz / 1000).toFixed(2)} GHz` : null],
+    ['Booted', info.boot_time ? new Date(info.boot_time * 1000).toLocaleString() : null],
+    ['Agent', info.agent_version],
+  ]);
+  kv(parts.mem, [
+    ['Used', L.mem_used != null ? `${size(L.mem_used)} (${pct(memPct)})` : null],
+    ['Available', L.mem_available ? size(L.mem_available) : null],
+    ['Total', size(info.mem_total)],
+    ['Swap', L.swap_total ? `${size(L.swap_used)} of ${size(L.swap_total)}` : 'none'],
+  ]);
+  const ifaces = L.ifaces || [];
+  kv(parts.net, ifaces.length ? ifaces.map(i => [i.name, `↓ ${rate(i.rx_bps)}  ↑ ${rate(i.tx_bps)}`])
+    : [['All interfaces', L.net_rx_bps != null ? `↓ ${rate(L.net_rx_bps)}  ↑ ${rate(L.net_tx_bps)}` : '—']]);
+
+  const s1 = css('--s1'), s2 = css('--s2');
+  panels.cpu.update({ times, max: 100, fmt: v => v.toFixed(0) + '%', series: [{ label: 'CPU', color: s1, values: hist.map(s => s.cpu_pct) }] }, pct(L.cpu_pct));
+  panels.mem.update({ times, max: 100, fmt: v => v.toFixed(0) + '%', series: [{ label: 'used', color: s2, values: hist.map(s => s.mem_used / info.mem_total * 100) }] }, pct(memPct));
+  panels.net.update({ times, fmt: rate, unit: 1024, series: [
+    { label: 'download', color: s1, values: hist.map(s => s.net_rx_bps) },
+    { label: 'upload', color: s2, values: hist.map(s => s.net_tx_bps) }] },
+    L.net_rx_bps != null ? `↓ ${rate(L.net_rx_bps)} ↑ ${rate(L.net_tx_bps)}` : '—');
+  panels.disk.root.hidden = !rich;
+  if (rich) panels.disk.update({ times, fmt: rate, unit: 1024, series: [
+    { label: 'read', color: s1, values: hist.map(s => s.disk_read_bps ?? null) },
+    { label: 'write', color: s2, values: hist.map(s => s.disk_write_bps ?? null) }] },
+    `R ${rate(L.disk_read_bps)} W ${rate(L.disk_write_bps)}`);
+  const hasTemp = hist.some(s => s.temp_max_c != null);
+  panels.temp.root.hidden = !hasTemp;
+  if (hasTemp) panels.temp.update({ times, max: 110, fmt: v => v.toFixed(0) + ' °C',
+    series: [{ label: 'hottest sensor', color: s2, values: hist.map(s => s.temp_max_c ?? null) }] },
+    L.temp_max_c != null ? `${L.temp_max_c.toFixed(1)} °C` : '—');
+  const hasLoad = hist.some(s => s.load_avg);
+  panels.load.root.hidden = !hasLoad;
+  if (hasLoad) panels.load.update({ times, fmt: v => v.toFixed(1),
+    series: [{ label: '1 min', color: s1, values: hist.map(s => s.load_avg ? s.load_avg[0] : null) }] },
+    L.load_avg ? `${L.load_avg[0].toFixed(2)} on ${info.cores} cores` : '—');
+
+  const cores = L.cpu_cores || [];
+  parts.coresSec.hidden = !cores.length;
+  if (cores.length) parts.cores.replaceChildren(...cores.map((v, i) => el('div', { class: 'core', title: `core ${i}: ${v.toFixed(0)}%` },
+    el('div', { class: 'bar' }, el('div', { class: 'fill', style: `height:${Math.min(100, v).toFixed(1)}%` })), el('span', { class: 'num' }, i))));
+
+  const disks = L.disks || [];
+  parts.disksSec.hidden = !disks.length;
+  if (disks.length) parts.disks.replaceChildren(...disks.map(d => {
+    const used = d.total - d.available, p = used / d.total * 100, lv = level(p, 80, 92);
+    return el('div', { class: 'item' },
+      el('div', { class: 'line' }, el('strong', {}, d.mount), el('span', { class: 'muted' }, `${d.fs} · ${d.kind}`)),
+      el('div', { class: 'meter ' + lv, role: 'meter', 'aria-label': `${d.mount} used`, 'aria-valuenow': p.toFixed(0), 'aria-valuemin': 0, 'aria-valuemax': 100 },
+        el('div', { style: `width:${p.toFixed(1)}%` })),
+      el('div', { class: 'line num' },
+        el('span', {}, `${size(used)} of ${size(d.total)} · ${p.toFixed(0)}% `, lv ? el('span', { class: 'flag ' + lv }, lv === 'hot' ? 'nearly full' : 'filling up') : null),
+        el('span', { class: 'muted' }, `R ${rate(d.read_bps)} · W ${rate(d.write_bps)}`)));
+  }));
+
+  const temps = L.temps || [];
+  parts.tempsSec.hidden = !temps.length;
+  if (temps.length) parts.temps.replaceChildren(...temps.map(t => {
+    const cap = t.critical || 105, p = t.celsius / cap * 100, lv = level(p, 75, 90);
+    return el('div', { class: 'item' },
+      el('div', { class: 'line num' }, el('span', {}, t.label),
+        el('span', {}, `${t.celsius.toFixed(1)} °C`, t.critical ? el('span', { class: 'muted' }, ` / ${t.critical.toFixed(0)} critical`) : null)),
+      el('div', { class: 'meter ' + lv }, el('div', { style: `width:${Math.min(100, p).toFixed(1)}%` })));
+  }));
+
+  parts.procCount.textContent = L.proc_count ? `${L.proc_count} running` : '';
+  procTable(parts.procCpu, L.top || []);
+  procTable(parts.procMem, L.top_mem || []);
+  parts.procMemSec.hidden = !(L.top_mem || []).length;
+}
+
+// ---------------------------------------------------------------- routing
+function route() {
+  const m = location.hash.match(/^#host\/(.+)$/);
+  if (m) {
+    const name = decodeURIComponent(m[1]);
+    overview.hidden = true; detail.hidden = false;
+    if (!view || view.name !== name) openDetail(name); else renderDetail();
+    document.title = `${name} · fleetmon`;
+  } else {
+    view = null; detail.hidden = true; overview.hidden = false;
+    document.title = 'fleetmon';
+    for (const n of hosts.keys()) renderCard(n);
+  }
+}
+addEventListener('hashchange', route);
+addEventListener('resize', () => { if (view) renderDetail(); else for (const n of hosts.keys()) renderCard(n); });
+
+// ---------------------------------------------------------------- live data
+function touched(name) {
+  if (view) { if (view.name === name) renderDetail(); }
+  else renderCard(name);
 }
 
 function onMsg(m) {
   switch (m.type) {
     case 'snapshot':
-      hosts.clear(); grid.innerHTML = '';
-      if (!m.hosts.length) grid.innerHTML = '<div class="empty">No agents yet.</div>';
-      for (const h of m.hosts) { hosts.set(h.info.name, h); limit = Math.max(limit, h.history.length); render(h.info.name); }
+      hosts.clear(); overview.replaceChildren();
+      for (const h of m.hosts) { hosts.set(h.info.name, h); limit = Math.max(limit, h.history.length); }
+      if (!m.hosts.length) overview.append(el('div', { class: 'empty' }, 'No agents yet.'));
+      route();
       break;
     case 'host': {
-      const h = hosts.get(m.info.name) || { history: [] };
+      const h = hosts.get(m.info.name) || { history: [], latest: null };
       hosts.set(m.info.name, { ...h, info: m.info, online: true });
-      render(m.info.name);
+      touched(m.info.name);
       break;
     }
     case 'sample': {
       const h = hosts.get(m.host); if (!h) return;
-      h.history.push(m.sample);
+      h.latest = m.sample;
+      h.history.push(slim(m.sample));
       if (h.history.length > limit) h.history.shift();
-      render(m.host);
+      touched(m.host);
       break;
     }
     case 'offline': {
       const h = hosts.get(m.host); if (!h) return;
-      h.online = false; render(m.host);
+      h.online = false; touched(m.host);
       break;
     }
     case 'removed':
       hosts.delete(m.host);
       document.getElementById('h-' + m.host)?.remove();
-      if (!hosts.size) grid.innerHTML = '<div class="empty">No agents yet.</div>';
+      if (!hosts.size) overview.replaceChildren(el('div', { class: 'empty' }, 'No agents yet.'));
+      if (view && view.name === m.host) renderDetail();
       break;
   }
 }

@@ -26,9 +26,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-
 if [ "$uninstall" = 1 ]; then
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   rm -f "$PLIST"
   rm -rf "$DIR"
   echo "removed $LABEL"
@@ -43,15 +42,17 @@ fi
 cd "$(dirname "$0")/.."
 cargo build --release --locked -q -p fleetmon-agent
 
+# Everything that can fail runs before the running agent is touched: a typo or a
+# failed build must leave the current install working.
 mkdir -p "$DIR" "$(dirname "$PLIST")" "$(dirname "$LOG")"
-install -m 755 target/release/fleetmon-agent "$DIR/fleetmon-agent"
-install -m 600 "$token" "$DIR/token"
 
 name_args=""
 [ -n "$name" ] && name_args="    <string>--name</string>
     <string>$name</string>"
 
-cat > "$PLIST" <<PLIST
+new_plist=$(mktemp)
+trap 'rm -f "$new_plist"' EXIT
+cat > "$new_plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -88,8 +89,14 @@ $name_args
 </dict>
 </plist>
 PLIST
-plutil -lint -s "$PLIST"
+plutil -lint -s "$new_plist"
 
+# Only now swap: stop the old agent (its binary cannot be replaced while it
+# runs under launchd's KeepAlive), install, start.
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+install -m 755 target/release/fleetmon-agent "$DIR/fleetmon-agent"
+install -m 600 "$token" "$DIR/token"
+install -m 644 "$new_plist" "$PLIST"
 launchctl bootstrap "$DOMAIN" "$PLIST"
 sleep 3
 state=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk -F'= ' '/^\tstate/ {print $2; exit}')

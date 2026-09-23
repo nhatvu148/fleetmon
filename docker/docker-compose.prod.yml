@@ -1,0 +1,26 @@
+services:
+  fleetmon:
+    # Built and pushed by .github/workflows/ci.yml on every push to main.
+    image: ghcr.io/nhatvu148/fleetmon:latest
+    container_name: fleetmon
+    restart: unless-stopped
+    environment:
+      # Every request arrives from the reverse proxy, so the allowlist is the
+      # proxy's network. The proxy is the real gate for the page; /agent is
+      # gated by the token.
+      FLEETMON_ALLOW: ${FLEETMON_ALLOW:?set FLEETMON_ALLOW to the proxy network CIDR}
+      FLEETMON_TOKEN_FILE: /run/secrets/fleetmon-token
+    volumes:
+      # Created by `task deploy:token`, owned by the image's nonroot uid.
+      - ./token:/run/secrets/fleetmon-token:ro
+    # A few hosts at five minutes of history is a couple of MB. The cap keeps a
+    # leak here from starving everything else on a shared box.
+    mem_limit: 64m
+    memswap_limit: 64m
+    # No published port: the reverse proxy reaches it by container name.
+    networks:
+      - proxy-network
+
+networks:
+  proxy-network:
+    external: true

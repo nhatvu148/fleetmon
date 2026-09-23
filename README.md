@@ -38,6 +38,8 @@ To accept agents from other machines, bind an address they can reach and allow t
 fleetmon-hub --bind 100.64.0.1:7070 --allow 100.64.0.0/10 --token-file fleetmon.token
 ```
 
+To run the hub on a server behind a reverse proxy and TLS, see [docs/deploy.md](docs/deploy.md); agents then connect with `--hub wss://your.domain`.
+
 ## Options
 
 | Hub | Env | Default | |

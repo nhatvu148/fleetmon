@@ -124,6 +124,9 @@ pub struct Config {
 /// Connects, streams samples, and reconnects with backoff forever. Returns only
 /// on an error that retrying cannot fix, such as a malformed hub URL.
 pub async fn run(cfg: Config) -> Result<()> {
+    // Needed before the first wss:// connect. Errors only if a provider is
+    // already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let url = format!("{}{}", cfg.hub.trim_end_matches('/'), AGENT_PATH);
     // Held across connections so CPU and network deltas carry over. It is `None`
     // only if a sample panicked mid-flight; `stream` then builds a fresh one

@@ -15,6 +15,12 @@ futures-util.workspace = true
 serde_json.workspace = true
 sysinfo = "0.39"
 tokio.workspace = true
-tokio-tungstenite = "0.30"
+# wss:// with bundled roots, so it behaves the same on a Windows box whose
+# certificate store nobody maintains.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# The crypto backend, chosen explicitly: rustls ships with none enabled here.
+# ring rather than aws-lc-rs because aws-lc-rs needs cmake and nasm to build on
+# Windows, which the agent's main target should not require.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -1,0 +1,104 @@
+version: '3'
+
+# Deployment target lives in .env.deploy, which is gitignored. Copy
+# .env.deploy.example and fill it in. Nothing about the host belongs in a
+# tracked file.
+dotenv: ['.env.deploy']
+
+vars:
+  DEPLOY_SERVER: '{{.DEPLOY_SERVER}}'
+  DEPLOY_DIR: '{{.DEPLOY_DIR | default "/root/fleetmon"}}'
+  DOMAIN: '{{.DOMAIN}}'
+  # The nonroot user in gcr.io/distroless/*:nonroot. The token file is owned by
+  # it so the container can read it and nothing else on the box needs to.
+  NONROOT_UID: '65532'
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  check:
+    desc: fmt, clippy and tests — what CI runs
+    cmds:
+      - cargo fmt --all --check
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test --all
+
+  # ---------------------------------------------------------------- deploy
+  #
+  # The hub runs as a container on a box whose reverse proxy terminates nothing:
+  # the CDN in front handles TLS, the proxy routes by host name over a shared
+  # docker network. Agents are not deployed from here.
+
+  deploy:preflight:
+    desc: Refuse to deploy unless the server has memory to spare
+    silent: true
+    cmds:
+      # The image is small, but the box is shared; never be the thing that
+      # tips it over.
+      - |
+        ssh root@{{.DEPLOY_SERVER}} '
+          avail=$(free -m | awk "/^Mem:/ {print \$7}")
+          echo "available RAM: ${avail}MB"
+          [ "$avail" -ge 300 ] || { echo "REFUSING: need >=300MB available RAM"; exit 1; }
+        '
+
+  deploy:token:
+    desc: One-time — create the agent token on the server if it does not exist
+    silent: true
+    cmds:
+      # Generated on the server, never printed, never on a command line.
+      # Distribute it to agents with `deploy:token:fetch`.
+      - |
+        ssh root@{{.DEPLOY_SERVER}} '
+          mkdir -p {{.DEPLOY_DIR}} && cd {{.DEPLOY_DIR}}
+          if [ -s token ]; then echo "token exists; leaving it"; exit 0; fi
+          umask 077 && openssl rand -hex 24 > token
+          chown {{.NONROOT_UID}}:{{.NONROOT_UID}} token && chmod 400 token
+          echo "token created"
+        '
+
+  deploy:token:fetch:
+    desc: 'Copy the agent token to a local file. OUT=<path> (default fleetmon.token, gitignored)'
+    silent: true
+    vars:
+      OUT: '{{.OUT | default "fleetmon.token"}}'
+    cmds:
+      - (umask 077 && ssh root@{{.DEPLOY_SERVER}} 'cat {{.DEPLOY_DIR}}/token' > {{.OUT}})
+      - 'echo "token written to {{.OUT}}"'
+
+  deploy:pull:
+    desc: Ship the compose file and pull the image from GHCR
+    deps: [deploy:preflight]
+    cmds:
+      - ssh root@{{.DEPLOY_SERVER}} 'mkdir -p {{.DEPLOY_DIR}}'
+      - scp docker/docker-compose.prod.yml root@{{.DEPLOY_SERVER}}:{{.DEPLOY_DIR}}/
+      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && docker compose -f docker-compose.prod.yml pull'
+
+  deploy:start:
+    desc: Start or restart the container via compose
+    cmds:
+      - ssh root@{{.DEPLOY_SERVER}} 'test -s {{.DEPLOY_DIR}}/token || { echo "no token; run task deploy:token"; exit 1; }'
+      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && FLEETMON_ALLOW={{.FLEETMON_ALLOW}} docker compose -f docker-compose.prod.yml up -d'
+      - ssh root@{{.DEPLOY_SERVER}} 'sleep 3; docker ps --filter name=^fleetmon$ --format "{{"{{"}}.Status{{"}}"}}"; docker logs --tail 5 fleetmon'
+
+  deploy:logs:
+    desc: Tail the container logs on the server
+    cmds:
+      - ssh root@{{.DEPLOY_SERVER}} 'docker logs -f --tail 80 fleetmon'
+
+  deploy:down:
+    desc: Stop and remove the container on the server
+    cmds:
+      - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && docker compose -f docker-compose.prod.yml down'
+
+  deploy:
+    desc: Full deploy — preflight, pull from GHCR, restart
+    cmds:
+      - task: deploy:pull
+      - task: deploy:start
+      - ssh root@{{.DEPLOY_SERVER}} 'docker image prune -f'
+      - 'echo "deployed: https://{{.DOMAIN}}"'

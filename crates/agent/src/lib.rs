@@ -113,7 +113,8 @@ fn now_ms() -> u64 {
 }
 
 pub struct Config {
-    /// Hub base URL, e.g. `ws://100.64.0.1:7070`. [`AGENT_PATH`] is appended.
+    /// Hub base URL: `ws://100.64.0.1:7070` on a private network, or
+    /// `wss://hub.example.com` behind TLS. [`AGENT_PATH`] is appended.
     pub hub: String,
     pub token: String,
     pub name: String,

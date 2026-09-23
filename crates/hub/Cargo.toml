@@ -1,0 +1,25 @@
+[package]
+name = "fleetmon-hub"
+description = "Collects samples from fleetmon agents and serves a live page"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+fleetmon-proto.workspace = true
+anyhow.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+clap.workspace = true
+futures-util.workspace = true
+ipnet = "2.12"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite = "0.30"
+fleetmon-agent = { path = "../agent" }

@@ -1,0 +1,31 @@
+services:
+  fleetmon:
+    # Built and pushed by .github/workflows/ci.yml on every push to main.
+    image: ghcr.io/nhatvu148/fleetmon:latest
+    container_name: fleetmon
+    restart: unless-stopped
+    environment:
+      # The hub's own network, which only it and the reverse proxy join — NOT
+      # the shared proxy network. On that one every other app's container
+      # could reach the hub directly and skip the proxy's auth, so one SSRF
+      # in any of them would expose the page.
+      FLEETMON_ALLOW: ${FLEETMON_SUBNET:?set FLEETMON_SUBNET}
+      FLEETMON_TOKEN_FILE: /run/secrets/fleetmon-token
+    volumes:
+      # Created by `task deploy:token`, owned by the image's nonroot uid.
+      - ./token:/run/secrets/fleetmon-token:ro
+    # A few hosts at five minutes of history is a couple of MB. The cap keeps a
+    # leak here from starving everything else on a shared box.
+    mem_limit: 64m
+    memswap_limit: 64m
+    # No published port: the reverse proxy reaches it by container name, after
+    # joining this network (see docs/deploy.md).
+    networks:
+      - fleetmon
+
+networks:
+  fleetmon:
+    name: fleetmon
+    ipam:
+      config:
+        - subnet: ${FLEETMON_SUBNET:?set FLEETMON_SUBNET}

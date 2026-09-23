@@ -7,7 +7,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Hub base URL, e.g. ws://100.64.0.1:7070
+    /// Hub base URL, e.g. ws://100.64.0.1:7070 or wss://hub.example.com
     #[arg(long, env = "FLEETMON_HUB")]
     hub: String,
     /// File holding the shared token. Preferred over FLEETMON_TOKEN: it keeps

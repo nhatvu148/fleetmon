@@ -33,3 +33,19 @@ jobs:
       cache-key: windows
       commands: |
         cargo test --all
+
+  # Only from main, only once both test jobs pass. Public repo, so the package
+  # is made public and the server pulls it anonymously.
+  image:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [linux, windows]
+    uses: nhatvu148/shared-workflows/.github/workflows/docker-publish.yml@v2
+    permissions:
+      contents: read
+      packages: write
+    with:
+      dockerfile: ./docker/Dockerfile
+      platforms: linux/amd64
+      package-name: fleetmon
+      min-versions-to-keep: 10
+      require-public: true

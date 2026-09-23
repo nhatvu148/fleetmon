@@ -435,10 +435,8 @@ mod tests {
         let info = s.host_info("test".into());
         assert_eq!(r.cpu_cores.len(), info.cores);
         assert!(r.mem_available > 0 && r.mem_available <= info.mem_total);
-        assert!(
-            !r.disks.is_empty(),
-            "every test machine has at least one real disk"
-        );
+        // A container may have no real disk at all (overlay is filtered out), so
+        // only the invariants are checked, not that a disk exists.
         assert!(r.disks.iter().all(|d| d.available <= d.total));
         assert!(r.proc_count > 0);
         assert!(r.top_mem.windows(2).all(|w| w[0].mem >= w[1].mem));

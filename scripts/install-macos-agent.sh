@@ -35,7 +35,9 @@ if [ "$uninstall" = 1 ]; then
 fi
 
 # Both values are written into the plist; accept only what they need to be.
-[[ "$hub" =~ ^wss?://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$ ]] || { echo "invalid --hub: $hub" >&2; exit 2; }
+[[ "$hub" =~ ^wss?://[A-Za-z0-9.-]+(:([0-9]{1,5}))?/?$ ]] || { echo "invalid --hub: $hub" >&2; exit 2; }
+port=${BASH_REMATCH[2]:-}
+[ -z "$port" ] || { [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; } || { echo "invalid --hub port: $port" >&2; exit 2; }
 [ -z "$name" ] || [[ "$name" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "invalid --name: $name" >&2; exit 2; }
 [ -s "$token" ] || { echo "no token at --token-file ${token:-<unset>}" >&2; exit 2; }
 
@@ -92,12 +94,28 @@ PLIST
 plutil -lint -s "$new_plist"
 
 # Only now swap: stop the old agent (its binary cannot be replaced while it
-# runs under launchd's KeepAlive), install, start.
+# runs under launchd's KeepAlive), install, start. The current install is kept
+# aside first, and restored and restarted if any step of the swap fails.
+bak=$(mktemp -d)
+trap 'rm -f "$new_plist"; rm -rf "$bak"' EXIT
+for f in "$DIR/fleetmon-agent" "$DIR/token" "$PLIST"; do
+  if [ -e "$f" ]; then cp -p "$f" "$bak/"; fi
+done
+rollback() {
+  echo "install failed; restoring the previous agent" >&2
+  if [ -e "$bak/fleetmon-agent" ]; then cp -p "$bak/fleetmon-agent" "$DIR/"; fi
+  if [ -e "$bak/token" ]; then cp -p "$bak/token" "$DIR/"; fi
+  if [ -e "$bak/$(basename "$PLIST")" ]; then
+    cp -p "$bak/$(basename "$PLIST")" "$PLIST"
+    launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null || true
+  fi
+  exit 1
+}
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-install -m 755 target/release/fleetmon-agent "$DIR/fleetmon-agent"
-install -m 600 "$token" "$DIR/token"
-install -m 644 "$new_plist" "$PLIST"
-launchctl bootstrap "$DOMAIN" "$PLIST"
+install -m 755 target/release/fleetmon-agent "$DIR/fleetmon-agent" || rollback
+install -m 600 "$token" "$DIR/token" || rollback
+install -m 644 "$new_plist" "$PLIST" || rollback
+launchctl bootstrap "$DOMAIN" "$PLIST" || rollback
 sleep 3
 state=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk -F'= ' '/^\tstate/ {print $2; exit}')
 echo "$LABEL: ${state:-unknown}"

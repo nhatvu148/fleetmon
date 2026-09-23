@@ -27,6 +27,20 @@ tasks:
       - cargo clippy --all-targets -- -D warnings
       - cargo test --all
 
+  # ---------------------------------------------------------------- agents
+
+  agent:install:macos:
+    desc: 'Install the agent on this Mac as a LaunchAgent. HUB=wss://... TOKEN_FILE=<path> [NAME=]'
+    requires:
+      vars: [HUB, TOKEN_FILE]
+    cmds:
+      - scripts/install-macos-agent.sh --hub '{{.HUB}}' --token-file '{{.TOKEN_FILE}}' {{if .NAME}}--name '{{.NAME}}'{{end}}
+
+  agent:uninstall:macos:
+    desc: Remove the LaunchAgent, its binary and its token copy
+    cmds:
+      - scripts/install-macos-agent.sh --uninstall
+
   # ---------------------------------------------------------------- deploy
   #
   # The hub runs as a container on a box whose reverse proxy terminates nothing:

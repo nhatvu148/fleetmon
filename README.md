@@ -40,6 +40,11 @@ fleetmon-hub --bind 100.64.0.1:7070 --allow 100.64.0.0/10 --token-file fleetmon.
 
 To run the hub on a server behind a reverse proxy and TLS, see [docs/deploy.md](docs/deploy.md); agents then connect with `--hub wss://your.domain`.
 
+## Running the agent as a service
+
+- **macOS:** `task agent:install:macos HUB=wss://your.domain TOKEN_FILE=<path> [NAME=macbook]` builds the agent and installs a per-user LaunchAgent (starts at login, restarted if it exits; log in `~/Library/Logs/fleetmon-agent.log`). `task agent:uninstall:macos` removes it.
+- **Windows:** a scheduled task running `fleetmon-agent.exe` at startup does the same job. The binary cross-compiles from macOS or Linux with `cargo zigbuild --release --target x86_64-pc-windows-gnu -p fleetmon-agent`.
+
 ## Options
 
 | Hub | Env | Default | |
@@ -56,7 +61,7 @@ To run the hub on a server behind a reverse proxy and TLS, see [docs/deploy.md](
 | `--token-file` | `FLEETMON_TOKEN_FILE` | | or `FLEETMON_TOKEN` |
 | `--name` | `FLEETMON_NAME` | hostname | must be unique across the fleet |
 | `--interval-ms` | | `1000` | 250 to 10000 (the hub drops an agent after 15 s of silence) |
-| `--top` | | `5` | heaviest processes to report |
+| `--top` | | `5` | heaviest processes to report; the process list is re-read every 5th sample, the costliest part of sampling on Windows |
 
 Logging follows `RUST_LOG` (default `info`).
 

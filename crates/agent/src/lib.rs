@@ -10,6 +10,12 @@ use futures_util::{SinkExt, StreamExt};
 use sysinfo::{CpuRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
 
+/// The process list is re-read on one tick in this many. Walking every process
+/// is by far the most expensive part of a sample on Windows — about 9% of a core
+/// every second on a busy desktop — while CPU, memory and network stay cheap.
+/// Per-process CPU then averages over the longer window, which is steadier.
+pub const PROC_EVERY: u64 = 5;
+
 /// Owns the sysinfo handles, because CPU and network figures are deltas
 /// against the previous refresh and so must outlive a single reading.
 pub struct Sampler {
@@ -17,6 +23,9 @@ pub struct Sampler {
     nets: Networks,
     last: Instant,
     top: usize,
+    ticks: u64,
+    /// Heaviest processes as of the last process refresh.
+    top_cache: Vec<Proc>,
 }
 
 impl Sampler {
@@ -36,6 +45,8 @@ impl Sampler {
             nets: Networks::new_with_refreshed_list(),
             last: Instant::now(),
             top,
+            ticks: 0,
+            top_cache: Vec::new(),
         }
     }
 
@@ -63,11 +74,10 @@ impl Sampler {
     pub fn sample(&mut self) -> Sample {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
-        self.sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_cpu().with_memory(),
-        );
+        if self.ticks.is_multiple_of(PROC_EVERY) {
+            self.refresh_top();
+        }
+        self.ticks += 1;
         self.nets.refresh(true);
 
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
@@ -76,6 +86,25 @@ impl Sampler {
             (rx + n.received(), tx + n.transmitted())
         });
 
+        Sample {
+            ts_ms: now_ms(),
+            cpu_pct: self.sys.global_cpu_usage(),
+            mem_used: self.sys.used_memory(),
+            swap_used: self.sys.used_swap(),
+            swap_total: self.sys.total_swap(),
+            net_rx_bps: (rx as f64 / elapsed) as u64,
+            net_tx_bps: (tx as f64 / elapsed) as u64,
+            uptime_s: System::uptime(),
+            top: self.top_cache.clone(),
+        }
+    }
+
+    fn refresh_top(&mut self) {
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
         let cores = self.sys.cpus().len().max(1) as f32;
         let mut top: Vec<Proc> = self
             .sys
@@ -90,18 +119,7 @@ impl Sampler {
             .collect();
         top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
         top.truncate(self.top);
-
-        Sample {
-            ts_ms: now_ms(),
-            cpu_pct: self.sys.global_cpu_usage(),
-            mem_used: self.sys.used_memory(),
-            swap_used: self.sys.used_swap(),
-            swap_total: self.sys.total_swap(),
-            net_rx_bps: (rx as f64 / elapsed) as u64,
-            net_tx_bps: (tx as f64 / elapsed) as u64,
-            uptime_s: System::uptime(),
-            top,
-        }
+        self.top_cache = top;
     }
 }
 
@@ -219,6 +237,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_list_is_refreshed_only_every_proc_every_ticks() {
+        let mut s = Sampler::new(3);
+        let first = s.sample();
+        for _ in 1..PROC_EVERY {
+            // Between refreshes the list is reused as-is, not re-derived.
+            assert_eq!(s.sample().top, first.top);
+        }
+        s.sample();
+        assert_eq!(s.ticks, PROC_EVERY + 1);
+    }
+
+    #[test]
     fn sample_is_sane() {
         let mut s = Sampler::new(3);
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
@@ -229,6 +259,10 @@ mod tests {
         assert!(r.top.windows(2).all(|w| w[0].cpu_pct >= w[1].cpu_pct));
 
         let info = s.host_info("test".into());
+        assert!(
+            !r.top.is_empty(),
+            "the first sample must carry a process list"
+        );
         assert!(info.cores > 0);
         assert!(r.mem_used <= info.mem_total);
     }

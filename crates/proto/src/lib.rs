@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 pub const AGENT_PATH: &str = "/agent";
 /// Path the browser page connects to on the hub.
 pub const UI_PATH: &str = "/ws";
+/// Longest gap an agent may leave between samples. The hub drops an agent
+/// after [`AGENT_SILENCE_MS`], so this must stay below it with room for a slow
+/// sample.
+pub const MAX_INTERVAL_MS: u64 = 10_000;
+/// How long the hub waits for anything from an agent before calling it gone.
+pub const AGENT_SILENCE_MS: u64 = MAX_INTERVAL_MS + 5_000;
 
 /// What a machine is. Sent once per connection, before any sample.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

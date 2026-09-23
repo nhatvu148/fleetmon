@@ -46,13 +46,14 @@ fleetmon-hub --bind 100.64.0.1:7070 --allow 100.64.0.0/10 --token-file fleetmon.
 | `--allow` | `FLEETMON_ALLOW` | *(loopback only)* | comma-separated IPs/CIDRs |
 | `--token-file` | `FLEETMON_TOKEN_FILE` | | or `FLEETMON_TOKEN`; at least 16 characters |
 | `--history` | | `300` | samples kept per host |
+| `--max-hosts` | | `64` | distinct hosts kept; when full, an offline host is forgotten to make room |
 
 | Agent | Env | Default | |
 |---|---|---|---|
 | `--hub` | `FLEETMON_HUB` | | e.g. `ws://100.64.0.1:7070` |
 | `--token-file` | `FLEETMON_TOKEN_FILE` | | or `FLEETMON_TOKEN` |
 | `--name` | `FLEETMON_NAME` | hostname | must be unique across the fleet |
-| `--interval-ms` | | `1000` | minimum 250 |
+| `--interval-ms` | | `1000` | 250 to 10000 (the hub drops an agent after 15 s of silence) |
 | `--top` | | `5` | heaviest processes to report |
 
 Logging follows `RUST_LOG` (default `info`).

@@ -125,7 +125,10 @@ pub struct Config {
 /// on an error that retrying cannot fix, such as a malformed hub URL.
 pub async fn run(cfg: Config) -> Result<()> {
     let url = format!("{}{}", cfg.hub.trim_end_matches('/'), AGENT_PATH);
-    let mut sampler = Some(Sampler::new(cfg.top));
+    // Held across connections so CPU and network deltas carry over. It is `None`
+    // only if a sample panicked mid-flight; `stream` then builds a fresh one
+    // rather than taking the whole agent down with it.
+    let mut sampler = None;
     let mut backoff = Duration::from_secs(1);
 
     loop {
@@ -159,8 +162,7 @@ type Ws =
 async fn stream(ws: Ws, sampler: &mut Option<Sampler>, cfg: &Config) -> Result<()> {
     let (mut tx, mut rx) = ws.split();
     let info = sampler
-        .as_ref()
-        .expect("sampler is always returned")
+        .get_or_insert_with(|| Sampler::new(cfg.top))
         .host_info(cfg.name.clone());
     tx.send(Message::text(serde_json::to_string(&AgentMsg::Hello(
         info,
@@ -174,12 +176,15 @@ async fn stream(ws: Ws, sampler: &mut Option<Sampler>, cfg: &Config) -> Result<(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                let mut s = sampler.take().expect("sampler is always returned");
+                let mut s = sampler.take().unwrap_or_else(|| Sampler::new(cfg.top));
+                // If this panics the sampler is lost with it, `?` ends the
+                // connection, and the next one starts with a new sampler.
                 let (s, reading) = tokio::task::spawn_blocking(move || {
                     let reading = s.sample();
                     (s, reading)
                 })
-                .await?;
+                .await
+                .context("sampling panicked")?;
                 *sampler = Some(s);
                 tx.send(Message::text(serde_json::to_string(&AgentMsg::Sample(reading))?)).await?;
             }

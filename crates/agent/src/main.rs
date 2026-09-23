@@ -19,8 +19,9 @@ struct Args {
     /// Name shown on the hub. Defaults to the hostname.
     #[arg(long, env = "FLEETMON_NAME")]
     name: Option<String>,
-    /// Milliseconds between samples.
-    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(250..))]
+    /// Milliseconds between samples. Capped well under the hub's silence
+    /// timeout, which would otherwise drop the agent between samples.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(250..=fleetmon_proto::MAX_INTERVAL_MS))]
     interval_ms: u64,
     /// How many of the heaviest processes to include.
     #[arg(long, default_value_t = 5)]

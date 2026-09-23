@@ -22,6 +22,10 @@ struct Args {
     /// Samples kept per host (at the default 1 s interval, 300 is five minutes).
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=100_000))]
     history: u64,
+    /// Distinct hosts kept. When full, an offline host is forgotten to make
+    /// room; a new name is refused only if every known host is online.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=10_000))]
+    max_hosts: u64,
 }
 
 /// A bare address means just that host.
@@ -64,6 +68,7 @@ async fn main() -> Result<()> {
         token,
         allow: args.allow,
         history: args.history as usize,
+        max_hosts: args.max_hosts as usize,
     });
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await

@@ -18,6 +18,7 @@ async fn start_hub() -> SocketAddr {
         token: TOKEN.into(),
         allow: vec![],
         history: 10,
+        max_hosts: 8,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

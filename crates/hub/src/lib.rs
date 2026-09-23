@@ -7,10 +7,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -25,18 +22,24 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
-use fleetmon_proto::{AGENT_PATH, AgentMsg, HostInfo, HostView, Sample, UI_PATH, UiMsg};
+use fleetmon_proto::{
+    AGENT_PATH, AGENT_SILENCE_MS, AgentMsg, HostInfo, HostView, Sample, UI_PATH, UiMsg,
+};
 use futures_util::{SinkExt, StreamExt};
 use ipnet::IpNet;
 use tokio::sync::broadcast;
 
 /// An agent that sends nothing for this long is treated as gone. Covers the
 /// case a close frame never arrives: a sleeping laptop, a dropped tunnel.
-const AGENT_SILENCE: Duration = Duration::from_secs(15);
+const AGENT_SILENCE: Duration = Duration::from_millis(AGENT_SILENCE_MS);
 /// A hello arrives immediately on a real agent; anything slower is not one.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// A sample with a few top processes is about 1 KB.
 const MAX_AGENT_FRAME: usize = 64 * 1024;
+/// Readers send nothing meaningful; this only bounds what they can make us buffer.
+const MAX_UI_FRAME: usize = 4 * 1024;
+/// Longest host name accepted in a hello.
+const MAX_NAME: usize = 64;
 
 pub struct Config {
     pub token: String,
@@ -44,6 +47,9 @@ pub struct Config {
     pub allow: Vec<IpNet>,
     /// Samples kept per host.
     pub history: usize,
+    /// Distinct host names kept. Together with `history` this bounds the hub's
+    /// memory, whatever a token holder sends.
+    pub max_hosts: usize,
 }
 
 #[derive(Clone)]
@@ -51,9 +57,18 @@ pub struct Hub(Arc<Inner>);
 
 struct Inner {
     cfg: Config,
-    hosts: Mutex<HashMap<String, Entry>>,
+    /// Every event is published while this lock is held, and a reader
+    /// subscribes and snapshots under it too. That makes "in the snapshot" and
+    /// "arrives as an event" mutually exclusive, so the page never sees one
+    /// sample twice.
+    state: Mutex<HubState>,
     events: broadcast::Sender<UiMsg>,
-    next_conn: AtomicU64,
+}
+
+#[derive(Default)]
+struct HubState {
+    hosts: HashMap<String, Entry>,
+    next_conn: u64,
 }
 
 struct Entry {
@@ -66,14 +81,35 @@ struct Entry {
     history: VecDeque<Sample>,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum Refused {
+    BadName,
+    Full,
+}
+
+impl HubState {
+    fn views(&self) -> Vec<HostView> {
+        let mut views: Vec<HostView> = self
+            .hosts
+            .values()
+            .map(|e| HostView {
+                info: e.info.clone(),
+                online: e.online,
+                history: e.history.iter().cloned().collect(),
+            })
+            .collect();
+        views.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+        views
+    }
+}
+
 impl Hub {
     pub fn new(cfg: Config) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self(Arc::new(Inner {
             cfg,
-            hosts: Mutex::default(),
+            state: Mutex::default(),
             events,
-            next_conn: AtomicU64::new(1),
         }))
     }
 
@@ -88,23 +124,41 @@ impl Hub {
     }
 
     pub fn snapshot(&self) -> Vec<HostView> {
-        let hosts = self.0.hosts.lock().unwrap();
-        let mut views: Vec<HostView> = hosts
-            .values()
-            .map(|e| HostView {
-                info: e.info.clone(),
-                online: e.online,
-                history: e.history.iter().cloned().collect(),
-            })
-            .collect();
-        views.sort_by(|a, b| a.info.name.cmp(&b.info.name));
-        views
+        self.0.state.lock().unwrap().views()
     }
 
-    fn hello(&self, info: HostInfo) -> u64 {
-        let conn = self.0.next_conn.fetch_add(1, Ordering::Relaxed);
-        let mut hosts = self.0.hosts.lock().unwrap();
-        match hosts.get_mut(&info.name) {
+    /// A receiver plus the state it starts from, taken atomically: every event
+    /// the receiver yields happened after the snapshot.
+    fn subscribe(&self) -> (broadcast::Receiver<UiMsg>, Vec<HostView>) {
+        let state = self.0.state.lock().unwrap();
+        (self.0.events.subscribe(), state.views())
+    }
+
+    /// Registers a connection under `info.name` and returns its id.
+    pub fn hello(&self, info: HostInfo) -> Result<u64, Refused> {
+        if info.name.is_empty()
+            || info.name.chars().count() > MAX_NAME
+            || info.name.chars().any(char::is_control)
+        {
+            return Err(Refused::BadName);
+        }
+        let mut state = self.0.state.lock().unwrap();
+        if !state.hosts.contains_key(&info.name) && state.hosts.len() >= self.0.cfg.max_hosts {
+            // Make room by forgetting an offline host; never evict a live one.
+            let stale = state
+                .hosts
+                .iter()
+                .filter(|(_, e)| !e.online)
+                .min_by_key(|(_, e)| e.history.back().map_or(0, |s| s.ts_ms))
+                .map(|(name, _)| name.clone());
+            let Some(stale) = stale else {
+                return Err(Refused::Full);
+            };
+            state.hosts.remove(&stale);
+        }
+        state.next_conn += 1;
+        let conn = state.next_conn;
+        match state.hosts.get_mut(&info.name) {
             Some(e) => {
                 if e.online {
                     tracing::warn!(host = %info.name, "name taken by a live connection; the newer one wins");
@@ -114,7 +168,7 @@ impl Hub {
                 e.online = true;
             }
             None => {
-                hosts.insert(
+                state.hosts.insert(
                     info.name.clone(),
                     Entry {
                         info: info.clone(),
@@ -125,21 +179,19 @@ impl Hub {
                 );
             }
         }
-        drop(hosts);
         let _ = self.0.events.send(UiMsg::Host { info });
-        conn
+        Ok(conn)
     }
 
     fn sample(&self, name: &str, conn: u64, sample: Sample) {
-        let mut hosts = self.0.hosts.lock().unwrap();
-        let Some(e) = hosts.get_mut(name).filter(|e| e.conn == conn) else {
+        let mut state = self.0.state.lock().unwrap();
+        let Some(e) = state.hosts.get_mut(name).filter(|e| e.conn == conn) else {
             return;
         };
         if e.history.len() >= self.0.cfg.history {
             e.history.pop_front();
         }
         e.history.push_back(sample.clone());
-        drop(hosts);
         let _ = self.0.events.send(UiMsg::Sample {
             host: name.to_string(),
             sample,
@@ -147,12 +199,11 @@ impl Hub {
     }
 
     fn gone(&self, name: &str, conn: u64) {
-        let mut hosts = self.0.hosts.lock().unwrap();
-        let Some(e) = hosts.get_mut(name).filter(|e| e.conn == conn) else {
+        let mut state = self.0.state.lock().unwrap();
+        let Some(e) = state.hosts.get_mut(name).filter(|e| e.conn == conn) else {
             return;
         };
         e.online = false;
-        drop(hosts);
         let _ = self.0.events.send(UiMsg::Offline {
             host: name.to_string(),
         });
@@ -216,7 +267,14 @@ async fn agent_session(hub: Hub, mut socket: WebSocket) {
     };
     let name = info.name.clone();
     tracing::info!(host = %name, os = %info.os, "agent online");
-    let conn = hub.hello(info);
+    let conn = match hub.hello(info) {
+        Ok(conn) => conn,
+        Err(why) => {
+            tracing::warn!(host = %name, "hello refused: {why:?}");
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
 
     loop {
         match tokio::time::timeout(AGENT_SILENCE, next_msg(&mut socket)).await {
@@ -249,17 +307,14 @@ async fn next_msg(socket: &mut WebSocket) -> Option<AgentMsg> {
 }
 
 async fn ui_ws(State(hub): State<Hub>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| ui_session(hub, socket))
+    ws.max_message_size(MAX_UI_FRAME)
+        .on_upgrade(move |socket| ui_session(hub, socket))
 }
 
 async fn ui_session(hub: Hub, socket: WebSocket) {
     let (mut tx, mut rx) = socket.split();
-    // Subscribe before snapshotting, so nothing falls between the two.
-    let mut events = hub.0.events.subscribe();
-    let snapshot = UiMsg::Snapshot {
-        hosts: hub.snapshot(),
-    };
-    if send(&mut tx, &snapshot).await.is_err() {
+    let (mut events, hosts) = hub.subscribe();
+    if send(&mut tx, &UiMsg::Snapshot { hosts }).await.is_err() {
         return;
     }
 
@@ -269,8 +324,13 @@ async fn ui_session(hub: Hub, socket: WebSocket) {
                 let msg = match ev {
                     Ok(m) => m,
                     // A slow reader missed events; a fresh snapshot is cheaper
-                    // than tracking what it missed.
-                    Err(broadcast::error::RecvError::Lagged(_)) => UiMsg::Snapshot { hosts: hub.snapshot() },
+                    // than tracking what it missed. Resubscribing with it keeps
+                    // the no-duplicates guarantee.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let (fresh, hosts) = hub.subscribe();
+                        events = fresh;
+                        UiMsg::Snapshot { hosts }
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 };
                 if send(&mut tx, &msg).await.is_err() {
@@ -313,6 +373,85 @@ mod tests {
         let allow: Vec<IpNet> = vec!["100.64.0.0/10".parse().unwrap()];
         assert!(is_allowed("::ffff:100.100.1.2".parse().unwrap(), &allow));
         assert!(is_allowed("::ffff:127.0.0.1".parse().unwrap(), &[]));
+    }
+
+    fn hub(max_hosts: usize) -> Hub {
+        Hub::new(Config {
+            token: "t".repeat(16),
+            allow: vec![],
+            history: 3,
+            max_hosts,
+        })
+    }
+
+    fn info(name: &str) -> HostInfo {
+        HostInfo {
+            name: name.into(),
+            os: "os".into(),
+            cpu_model: "cpu".into(),
+            cores: 1,
+            mem_total: 1,
+            agent_version: "0".into(),
+        }
+    }
+
+    #[test]
+    fn host_cap_evicts_offline_but_never_live() {
+        let hub = hub(2);
+        let a = hub.hello(info("a")).unwrap();
+        hub.hello(info("b")).unwrap();
+        assert_eq!(hub.hello(info("c")), Err(Refused::Full));
+        // A known name is not a new host, so it is never refused for space.
+        assert!(hub.hello(info("b")).is_ok());
+
+        hub.gone("a", a);
+        hub.hello(info("c")).unwrap();
+        let names: Vec<_> = hub.snapshot().into_iter().map(|v| v.info.name).collect();
+        assert_eq!(names, ["b", "c"]);
+    }
+
+    #[test]
+    fn bad_names_are_refused() {
+        let hub = hub(8);
+        assert_eq!(hub.hello(info("")), Err(Refused::BadName));
+        assert_eq!(hub.hello(info(&"x".repeat(65))), Err(Refused::BadName));
+        assert_eq!(hub.hello(info("a\nb")), Err(Refused::BadName));
+        assert!(hub.hello(info(&"x".repeat(64))).is_ok());
+    }
+
+    #[test]
+    fn stale_connection_cannot_touch_a_reclaimed_name() {
+        let hub = hub(8);
+        let old = hub.hello(info("a")).unwrap();
+        let new = hub.hello(info("a")).unwrap();
+        assert!(new > old);
+        hub.gone("a", old);
+        assert!(
+            hub.snapshot()[0].online,
+            "old socket marked the new one offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_after_subscribe_are_not_in_the_snapshot() {
+        let hub = hub(8);
+        let conn = hub.hello(info("a")).unwrap();
+        let (mut rx, snap) = hub.subscribe();
+        assert!(snap[0].history.is_empty());
+        let s = Sample {
+            ts_ms: 1,
+            cpu_pct: 0.0,
+            mem_used: 0,
+            swap_used: 0,
+            swap_total: 0,
+            net_rx_bps: 0,
+            net_tx_bps: 0,
+            uptime_s: 0,
+            top: vec![],
+        };
+        hub.sample("a", conn, s);
+        assert!(matches!(rx.recv().await.unwrap(), UiMsg::Sample { .. }));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

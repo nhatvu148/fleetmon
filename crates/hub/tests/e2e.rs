@@ -4,7 +4,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use fleetmon_hub::{Config, Hub};
 use fleetmon_proto::UiMsg;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -106,6 +106,27 @@ async fn wrong_token_is_refused() {
             .unwrap_err()
             .to_string();
         assert!(err.contains("401"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn refused_hello_says_why() {
+    let addr = start_hub().await;
+    let mut req = format!("ws://{addr}/agent").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let hello = serde_json::json!({
+        "type": "hello", "name": "", "os": "", "cpu_model": "",
+        "cores": 1, "mem_total": 1, "agent_version": "0",
+    });
+    ws.send(Message::text(hello.to_string())).await.unwrap();
+    match ws.next().await.unwrap().unwrap() {
+        Message::Close(Some(f)) => {
+            assert_eq!(u16::from(f.code), fleetmon_proto::CLOSE_REFUSED);
+            assert!(f.reason.contains("empty"), "{}", f.reason);
+        }
+        other => panic!("expected a close frame, got {other:?}"),
     }
 }
 

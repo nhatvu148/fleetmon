@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use fleetmon_proto::{AGENT_PATH, AgentMsg, HostInfo, Proc, Sample};
+use fleetmon_proto::{AGENT_PATH, AgentMsg, CLOSE_REFUSED, HostInfo, Proc, Sample};
 use futures_util::{SinkExt, StreamExt};
 use sysinfo::{CpuRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
@@ -140,8 +140,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         match tokio_tungstenite::connect_async(request).await {
             Ok((ws, _)) => {
                 tracing::info!(%url, "connected");
-                backoff = Duration::from_secs(1);
-                match stream(ws, &mut sampler, &cfg).await {
+                match stream(ws, &mut sampler, &mut backoff, &cfg).await {
                     Ok(()) => tracing::warn!("hub closed the connection"),
                     Err(e) => tracing::warn!("connection lost: {e:#}"),
                 }
@@ -159,7 +158,15 @@ pub async fn run(cfg: Config) -> Result<()> {
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn stream(ws: Ws, sampler: &mut Option<Sampler>, cfg: &Config) -> Result<()> {
+/// Streams until the connection ends. Resets `backoff` only once a sample has
+/// been sent: a hub that accepts the socket and then refuses the hello must not
+/// be retried every second.
+async fn stream(
+    ws: Ws,
+    sampler: &mut Option<Sampler>,
+    backoff: &mut Duration,
+    cfg: &Config,
+) -> Result<()> {
     let (mut tx, mut rx) = ws.split();
     let info = sampler
         .get_or_insert_with(|| Sampler::new(cfg.top))
@@ -187,10 +194,14 @@ async fn stream(ws: Ws, sampler: &mut Option<Sampler>, cfg: &Config) -> Result<(
                 .context("sampling panicked")?;
                 *sampler = Some(s);
                 tx.send(Message::text(serde_json::to_string(&AgentMsg::Sample(reading))?)).await?;
+                *backoff = Duration::from_secs(1);
             }
             frame = rx.next() => match frame {
                 // Pings are answered by tungstenite on the next write; nothing
                 // else is expected from the hub.
+                Some(Ok(Message::Close(Some(f)))) if u16::from(f.code) == CLOSE_REFUSED => {
+                    bail!("hub refused this agent: {}", f.reason)
+                }
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => bail!(e),

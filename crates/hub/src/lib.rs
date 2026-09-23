@@ -8,14 +8,14 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
     extract::{
         ConnectInfo, Request, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
@@ -23,7 +23,8 @@ use axum::{
     routing::get,
 };
 use fleetmon_proto::{
-    AGENT_PATH, AGENT_SILENCE_MS, AgentMsg, HostInfo, HostView, Sample, UI_PATH, UiMsg,
+    AGENT_PATH, AGENT_SILENCE_MS, AgentMsg, CLOSE_REFUSED, HostInfo, HostView, Sample, UI_PATH,
+    UiMsg,
 };
 use futures_util::{SinkExt, StreamExt};
 use ipnet::IpNet;
@@ -38,8 +39,6 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_AGENT_FRAME: usize = 64 * 1024;
 /// Readers send nothing meaningful; this only bounds what they can make us buffer.
 const MAX_UI_FRAME: usize = 4 * 1024;
-/// Longest host name accepted in a hello.
-const MAX_NAME: usize = 64;
 
 pub struct Config {
     pub token: String,
@@ -78,13 +77,26 @@ struct Entry {
     /// old socket finally drops.
     conn: u64,
     online: bool,
+    /// When the hub last heard from this host, by the hub's clock. Eviction
+    /// orders by this, never by the agent's own timestamps.
+    last_seen: Instant,
     history: VecDeque<Sample>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Refused {
-    BadName,
+    BadName(&'static str),
     Full,
+}
+
+impl Refused {
+    /// Sent to the agent as the close reason.
+    fn reason(&self) -> &'static str {
+        match self {
+            Refused::BadName(why) => why,
+            Refused::Full => "hub is full and every known host is online",
+        }
+    }
 }
 
 impl HubState {
@@ -105,7 +117,13 @@ impl HubState {
 
 impl Hub {
     pub fn new(cfg: Config) -> Self {
-        let (events, _) = broadcast::channel(1024);
+        Self::with_capacity(cfg, 1024)
+    }
+
+    /// `capacity` is how many events a slow reader may fall behind by before
+    /// it is resynced with a snapshot.
+    fn with_capacity(cfg: Config, capacity: usize) -> Self {
+        let (events, _) = broadcast::channel(capacity);
         Self(Arc::new(Inner {
             cfg,
             state: Mutex::default(),
@@ -136,12 +154,7 @@ impl Hub {
 
     /// Registers a connection under `info.name` and returns its id.
     pub fn hello(&self, info: HostInfo) -> Result<u64, Refused> {
-        if info.name.is_empty()
-            || info.name.chars().count() > MAX_NAME
-            || info.name.chars().any(char::is_control)
-        {
-            return Err(Refused::BadName);
-        }
+        fleetmon_proto::check_name(&info.name).map_err(Refused::BadName)?;
         let mut state = self.0.state.lock().unwrap();
         if !state.hosts.contains_key(&info.name) && state.hosts.len() >= self.0.cfg.max_hosts {
             // Make room by forgetting an offline host; never evict a live one.
@@ -149,12 +162,13 @@ impl Hub {
                 .hosts
                 .iter()
                 .filter(|(_, e)| !e.online)
-                .min_by_key(|(_, e)| e.history.back().map_or(0, |s| s.ts_ms))
+                .min_by_key(|(_, e)| e.last_seen)
                 .map(|(name, _)| name.clone());
             let Some(stale) = stale else {
                 return Err(Refused::Full);
             };
             state.hosts.remove(&stale);
+            let _ = self.0.events.send(UiMsg::Removed { host: stale });
         }
         state.next_conn += 1;
         let conn = state.next_conn;
@@ -166,6 +180,7 @@ impl Hub {
                 e.info = info.clone();
                 e.conn = conn;
                 e.online = true;
+                e.last_seen = Instant::now();
             }
             None => {
                 state.hosts.insert(
@@ -174,6 +189,7 @@ impl Hub {
                         info: info.clone(),
                         conn,
                         online: true,
+                        last_seen: Instant::now(),
                         history: VecDeque::new(),
                     },
                 );
@@ -188,6 +204,7 @@ impl Hub {
         let Some(e) = state.hosts.get_mut(name).filter(|e| e.conn == conn) else {
             return;
         };
+        e.last_seen = Instant::now();
         if e.history.len() >= self.0.cfg.history {
             e.history.pop_front();
         }
@@ -204,6 +221,7 @@ impl Hub {
             return;
         };
         e.online = false;
+        e.last_seen = Instant::now();
         let _ = self.0.events.send(UiMsg::Offline {
             host: name.to_string(),
         });
@@ -253,7 +271,10 @@ async fn agent_ws(State(hub): State<Hub>, headers: HeaderMap, ws: WebSocketUpgra
     if !bearer.is_some_and(|t| token_matches(t, &hub.0.cfg.token)) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // Both caps: max_message_size is checked only after a whole frame has been
+    // read, and a frame may otherwise be 16 MB.
     ws.max_message_size(MAX_AGENT_FRAME)
+        .max_frame_size(MAX_AGENT_FRAME)
         .on_upgrade(move |socket| agent_session(hub, socket))
 }
 
@@ -270,8 +291,13 @@ async fn agent_session(hub: Hub, mut socket: WebSocket) {
     let conn = match hub.hello(info) {
         Ok(conn) => conn,
         Err(why) => {
-            tracing::warn!(host = %name, "hello refused: {why:?}");
-            let _ = socket.send(Message::Close(None)).await;
+            tracing::warn!(host = %name, "hello refused: {}", why.reason());
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CLOSE_REFUSED,
+                    reason: why.reason().into(),
+                })))
+                .await;
             return;
         }
     };
@@ -308,6 +334,7 @@ async fn next_msg(socket: &mut WebSocket) -> Option<AgentMsg> {
 
 async fn ui_ws(State(hub): State<Hub>, ws: WebSocketUpgrade) -> Response {
     ws.max_message_size(MAX_UI_FRAME)
+        .max_frame_size(MAX_UI_FRAME)
         .on_upgrade(move |socket| ui_session(hub, socket))
 }
 
@@ -320,19 +347,8 @@ async fn ui_session(hub: Hub, socket: WebSocket) {
 
     loop {
         tokio::select! {
-            ev = events.recv() => {
-                let msg = match ev {
-                    Ok(m) => m,
-                    // A slow reader missed events; a fresh snapshot is cheaper
-                    // than tracking what it missed. Resubscribing with it keeps
-                    // the no-duplicates guarantee.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let (fresh, hosts) = hub.subscribe();
-                        events = fresh;
-                        UiMsg::Snapshot { hosts }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
-                };
+            msg = next_event(&hub, &mut events) => {
+                let Some(msg) = msg else { return };
                 if send(&mut tx, &msg).await.is_err() {
                     return;
                 }
@@ -343,6 +359,22 @@ async fn ui_session(hub: Hub, socket: WebSocket) {
                 Some(Ok(_)) => {}
             },
         }
+    }
+}
+
+/// The next thing to tell a reader. `None` once the hub is shutting down.
+async fn next_event(hub: &Hub, events: &mut broadcast::Receiver<UiMsg>) -> Option<UiMsg> {
+    match events.recv().await {
+        Ok(m) => Some(m),
+        // A slow reader missed events; a fresh snapshot is cheaper than
+        // tracking what it missed. Resubscribing with it keeps the
+        // no-duplicates guarantee.
+        Err(broadcast::error::RecvError::Lagged(_)) => {
+            let (fresh, hosts) = hub.subscribe();
+            *events = fresh;
+            Some(UiMsg::Snapshot { hosts })
+        }
+        Err(broadcast::error::RecvError::Closed) => None,
     }
 }
 
@@ -376,12 +408,78 @@ mod tests {
     }
 
     fn hub(max_hosts: usize) -> Hub {
-        Hub::new(Config {
-            token: "t".repeat(16),
-            allow: vec![],
-            history: 3,
-            max_hosts,
-        })
+        hub_with_capacity(max_hosts, 1024)
+    }
+
+    fn hub_with_capacity(max_hosts: usize, capacity: usize) -> Hub {
+        Hub::with_capacity(
+            Config {
+                token: "t".repeat(16),
+                allow: vec![],
+                history: 3,
+                max_hosts,
+            },
+            capacity,
+        )
+    }
+
+    fn reading(ts_ms: u64) -> Sample {
+        Sample {
+            ts_ms,
+            cpu_pct: 0.0,
+            mem_used: 0,
+            swap_used: 0,
+            swap_total: 0,
+            net_rx_bps: 0,
+            net_tx_bps: 0,
+            uptime_s: 0,
+            top: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn eviction_takes_the_longest_silent_and_tells_readers() {
+        let hub = hub(2);
+        let a = hub.hello(info("a")).unwrap();
+        let b = hub.hello(info("b")).unwrap();
+        // "a" claims the latest time by its own clock, but the hub heard from
+        // it longest ago. Only the hub's clock may decide.
+        hub.sample("a", a, reading(u64::MAX));
+        hub.gone("a", a);
+        std::thread::sleep(Duration::from_millis(5));
+        hub.gone("b", b);
+
+        let (mut rx, _) = hub.subscribe();
+        hub.hello(info("c")).unwrap();
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            UiMsg::Removed { host: "a".into() }
+        );
+        let names: Vec<_> = hub.snapshot().into_iter().map(|v| v.info.name).collect();
+        assert_eq!(names, ["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn a_lagging_reader_gets_one_snapshot_then_only_newer_events() {
+        let hub = hub_with_capacity(8, 2);
+        let conn = hub.hello(info("a")).unwrap();
+        let (mut rx, _) = hub.subscribe();
+        for t in 1..=5 {
+            hub.sample("a", conn, reading(t));
+        }
+        match next_event(&hub, &mut rx).await.unwrap() {
+            UiMsg::Snapshot { hosts } => {
+                let ts: Vec<_> = hosts[0].history.iter().map(|s| s.ts_ms).collect();
+                assert_eq!(ts, [3, 4, 5]);
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        hub.sample("a", conn, reading(6));
+        match next_event(&hub, &mut rx).await.unwrap() {
+            UiMsg::Sample { sample, .. } => assert_eq!(sample.ts_ms, 6),
+            other => panic!("expected sample, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     fn info(name: &str) -> HostInfo {
@@ -413,9 +511,12 @@ mod tests {
     #[test]
     fn bad_names_are_refused() {
         let hub = hub(8);
-        assert_eq!(hub.hello(info("")), Err(Refused::BadName));
-        assert_eq!(hub.hello(info(&"x".repeat(65))), Err(Refused::BadName));
-        assert_eq!(hub.hello(info("a\nb")), Err(Refused::BadName));
+        for bad in [String::new(), "x".repeat(65), "a\nb".into()] {
+            assert!(
+                matches!(hub.hello(info(&bad)), Err(Refused::BadName(_))),
+                "{bad:?}"
+            );
+        }
         assert!(hub.hello(info(&"x".repeat(64))).is_ok());
     }
 
@@ -438,18 +539,7 @@ mod tests {
         let conn = hub.hello(info("a")).unwrap();
         let (mut rx, snap) = hub.subscribe();
         assert!(snap[0].history.is_empty());
-        let s = Sample {
-            ts_ms: 1,
-            cpu_pct: 0.0,
-            mem_used: 0,
-            swap_used: 0,
-            swap_total: 0,
-            net_rx_bps: 0,
-            net_tx_bps: 0,
-            uptime_s: 0,
-            top: vec![],
-        };
-        hub.sample("a", conn, s);
+        hub.sample("a", conn, reading(1));
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::Sample { .. }));
         assert!(rx.try_recv().is_err());
     }

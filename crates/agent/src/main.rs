@@ -53,6 +53,11 @@ async fn main() -> Result<()> {
         .name
         .or_else(sysinfo::System::host_name)
         .context("no --name given and the hostname is unavailable")?;
+    // The hub applies the same rule; failing here beats being refused on
+    // every reconnect.
+    if let Err(why) = fleetmon_proto::check_name(&name) {
+        bail!("{why}: {name:?} (pass --name)");
+    }
 
     fleetmon_agent::run(fleetmon_agent::Config {
         hub: args.hub,

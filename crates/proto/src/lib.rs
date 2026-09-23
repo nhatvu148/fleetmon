@@ -16,6 +16,25 @@ pub const UI_PATH: &str = "/ws";
 pub const MAX_INTERVAL_MS: u64 = 10_000;
 /// How long the hub waits for anything from an agent before calling it gone.
 pub const AGENT_SILENCE_MS: u64 = MAX_INTERVAL_MS + 5_000;
+/// Longest host name a hub accepts, in characters.
+pub const MAX_NAME: usize = 64;
+/// WebSocket close code a hub sends when it refuses a hello (1008, policy
+/// violation). The close reason says why.
+pub const CLOSE_REFUSED: u16 = 1008;
+
+/// The hub's rule for host names, shared so an agent can reject a bad `--name`
+/// at startup instead of being refused on every reconnect.
+pub fn check_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        Err("host name is empty")
+    } else if name.chars().count() > MAX_NAME {
+        Err("host name is longer than 64 characters")
+    } else if name.chars().any(char::is_control) {
+        Err("host name contains a control character")
+    } else {
+        Ok(())
+    }
+}
 
 /// What a machine is. Sent once per connection, before any sample.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +113,10 @@ pub enum UiMsg {
         sample: Sample,
     },
     Offline {
+        host: String,
+    },
+    /// The hub forgot a host to make room for a new one.
+    Removed {
         host: String,
     },
 }

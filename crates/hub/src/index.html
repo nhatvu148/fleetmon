@@ -133,6 +133,11 @@ function onMsg(m) {
       h.online = false; render(m.host);
       break;
     }
+    case 'removed':
+      hosts.delete(m.host);
+      document.getElementById('h-' + m.host)?.remove();
+      if (!hosts.size) grid.innerHTML = '<div class="empty">No agents yet.</div>';
+      break;
   }
 }
 

@@ -282,15 +282,20 @@ impl Sampler {
 
         self.sensors.refresh(true);
         let live = &mut self.live_sensors;
+        live.begin_round();
+        // Keyed by label plus which occurrence of that label it is — not by list
+        // position, which shifts whenever an unrelated sensor comes or goes.
+        let mut occurrence: std::collections::HashMap<&str, usize> = Default::default();
         let mut temps: Vec<Temp> = self
             .sensors
             .list()
             .iter()
-            .enumerate()
-            .filter_map(|(i, c)| {
+            .filter_map(|c| {
+                let n = occurrence.entry(c.label()).or_default();
+                *n += 1;
+                let key = format!("{}#{}", c.label(), n);
                 let celsius = c.temperature().filter(|t| t.is_finite() && *t > 0.0)?;
-                // Labels repeat on some machines, so the position disambiguates.
-                if !live.observe(&format!("{i}:{}", c.label()), celsius) {
+                if !live.observe(&key, celsius) {
                     return None;
                 }
                 Some(Temp {
@@ -300,6 +305,7 @@ impl Sampler {
                 })
             })
             .collect();
+        live.end_round();
         temps.sort_by(|a, b| b.celsius.total_cmp(&a.celsius));
         temps.truncate(MAX_TEMPS);
         self.slow.temps = temps;
@@ -319,10 +325,24 @@ impl Sampler {
 struct LiveSensors {
     /// key -> (first reading, has it ever changed)
     seen: std::collections::HashMap<String, (f32, bool)>,
+    /// Keys observed in the current round, so sensors that vanish are dropped.
+    this_round: std::collections::HashSet<String>,
 }
 
 impl LiveSensors {
+    fn begin_round(&mut self) {
+        self.this_round.clear();
+    }
+
+    /// Forgets sensors not seen this round (hot-removed hardware), so the map
+    /// cannot grow for the life of the agent.
+    fn end_round(&mut self) {
+        let round = &self.this_round;
+        self.seen.retain(|k, _| round.contains(k));
+    }
+
     fn observe(&mut self, key: &str, celsius: f32) -> bool {
+        self.this_round.insert(key.to_string());
         let (first, live) = self.seen.entry(key.to_string()).or_insert((celsius, false));
         if celsius != *first {
             *live = true;
@@ -458,6 +478,20 @@ mod tests {
         assert!(live.observe("1:tdie", 44.1));
         // Keys are independent.
         assert!(!live.observe("0:Computer", 86.85));
+    }
+
+    #[test]
+    fn vanished_sensors_are_forgotten() {
+        let mut live = LiveSensors::default();
+        live.begin_round();
+        live.observe("a#1", 40.0);
+        live.observe("b#1", 50.0);
+        live.end_round();
+        live.begin_round();
+        live.observe("a#1", 40.5);
+        live.end_round();
+        assert_eq!(live.seen.len(), 1, "b#1 was not seen this round");
+        assert!(live.seen["a#1"].1, "a#1 changed, so it is live");
     }
 
     #[test]

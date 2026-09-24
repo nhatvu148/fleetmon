@@ -106,10 +106,21 @@ impl Range {
     }
 }
 
+/// What the writer thread is asked to do.
+enum Op {
+    /// Boxed: the bounded queue reserves a slot per entry, and an unboxed
+    /// sample would make each slot ~300 bytes.
+    Sample(String, Box<Sample>),
+    /// Delete every row for a host the hub has evicted, so the disk is bounded
+    /// by `--max-hosts` like memory is, not only by time.
+    Forget(String),
+}
+
 pub struct Store {
-    writes: mpsc::SyncSender<(String, Sample)>,
+    writes: mpsc::SyncSender<Op>,
     reader: Mutex<Connection>,
     dropped: std::sync::atomic::AtomicU64,
+    writer_dead: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -131,22 +142,38 @@ impl Store {
             writes: tx,
             reader: Mutex::new(reader),
             dropped: std::sync::atomic::AtomicU64::new(0),
+            writer_dead: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Queues a sample for writing. Never blocks: when the queue is full the
     /// sample is dropped from history (it is still shown live) and counted.
     pub fn record(&self, host: &str, sample: &Sample) {
+        self.send(Op::Sample(host.to_string(), Box::new(sample.slim())));
+    }
+
+    /// Queues the deletion of all of a host's rows.
+    pub fn forget(&self, host: &str) {
+        self.send(Op::Forget(host.to_string()));
+    }
+
+    fn send(&self, op: Op) {
         use std::sync::atomic::Ordering;
-        if self
-            .writes
-            .try_send((host.to_string(), sample.slim()))
-            .is_err()
-        {
-            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            // First drop, then one line per thousand: enough to notice.
-            if n == 1 || n.is_multiple_of(1000) {
-                tracing::warn!(dropped = n, "history queue full; samples not stored");
+        match self.writes.try_send(op) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                // First drop, then one line per thousand: enough to notice.
+                if n == 1 || n.is_multiple_of(1000) {
+                    tracing::warn!(dropped = n, "history queue full; samples not stored");
+                }
+            }
+            // The writer thread is gone: nothing more will be stored. Said once,
+            // and as what it is, not as a full queue.
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                if !self.writer_dead.swap(true, Ordering::Relaxed) {
+                    tracing::error!("history writer has stopped; no further history is stored");
+                }
             }
         }
     }
@@ -218,22 +245,29 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn write_loop(mut db: Connection, rx: mpsc::Receiver<(String, Sample)>) {
+fn write_loop(mut db: Connection, rx: mpsc::Receiver<Op>) {
     let mut last_prune = 0i64;
     loop {
         // Batch whatever arrived in the last second into one transaction.
-        let mut batch = Vec::new();
+        let mut ops = Vec::new();
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(first) => {
-                batch.push(first);
-                batch.extend(rx.try_iter());
+                ops.push(first);
+                ops.extend(rx.try_iter());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+        let (mut batch, mut forget) = (Vec::new(), Vec::new());
+        for op in ops {
+            match op {
+                Op::Sample(h, s) => batch.push((h, *s)),
+                Op::Forget(h) => forget.push(h),
+            }
+        }
         let now = now_ms();
         let prune = now - last_prune >= 3_600_000;
-        if let Err(e) = write(&mut db, &batch, now, prune) {
+        if let Err(e) = write(&mut db, &batch, &forget, now, prune) {
             tracing::warn!("history write failed: {e:#}");
         } else if prune {
             last_prune = now;
@@ -241,7 +275,13 @@ fn write_loop(mut db: Connection, rx: mpsc::Receiver<(String, Sample)>) {
     }
 }
 
-fn write(db: &mut Connection, batch: &[(String, Sample)], now: i64, prune: bool) -> Result<()> {
+fn write(
+    db: &mut Connection,
+    batch: &[(String, Sample)],
+    forget: &[String],
+    now: i64,
+    prune: bool,
+) -> Result<()> {
     let tx = db.transaction()?;
     {
         let mut ins = tx.prepare_cached(&format!(
@@ -273,6 +313,11 @@ fn write(db: &mut Connection, batch: &[(String, Sample)], now: i64, prune: bool)
         }
     }
     roll_up(&tx, now)?;
+    // After the inserts, so a sample queued just before the eviction goes too.
+    for host in forget {
+        tx.execute("DELETE FROM raw WHERE host = ?1", params![host])?;
+        tx.execute("DELETE FROM minute WHERE host = ?1", params![host])?;
+    }
     if prune {
         tx.execute(
             "DELETE FROM raw WHERE ts < ?1",
@@ -366,7 +411,7 @@ mod tests {
             ("a".to_string(), at(now - 5_000, 50.0)),
             ("b".to_string(), at(now - 5_000, 99.0)),
         ];
-        write(&mut db, &batch, now, false).unwrap();
+        write(&mut db, &batch, &[], now, false).unwrap();
 
         let recent = store.recent("a", 10).unwrap();
         assert_eq!(recent.len(), 3);
@@ -397,7 +442,7 @@ mod tests {
             .map(|i| ("a".to_string(), at(t0 + i * 1000, i as f32)))
             .collect();
         // Still inside the minute: nothing rolled up yet.
-        write(&mut db, &batch, t0 + 59_500, false).unwrap();
+        write(&mut db, &batch, &[], t0 + 59_500, false).unwrap();
         assert!(
             store
                 .history("a", Range::Day, t0 + 59_500)
@@ -405,17 +450,48 @@ mod tests {
                 .is_empty()
         );
         // The clock moves on: the minute is averaged exactly once.
-        write(&mut db, &[], t0 + 61_000, false).unwrap();
-        write(&mut db, &[], t0 + 62_000, false).unwrap();
+        write(&mut db, &[], &[], t0 + 61_000, false).unwrap();
+        write(&mut db, &[], &[], t0 + 62_000, false).unwrap();
         let day = store.history("a", Range::Day, t0 + 62_000).unwrap();
         assert_eq!(day.len(), 1);
         assert!((day[0].cpu_pct - 29.5).abs() < 1e-3, "mean of 0..59");
 
         // Far in the future, pruning empties raw but keeps the minute row.
         let later = t0 + 3 * 3_600_000;
-        write(&mut db, &[], later, true).unwrap();
+        write(&mut db, &[], &[], later, true).unwrap();
         assert!(store.recent("a", 100).unwrap().is_empty());
         assert_eq!(store.history("a", Range::Day, later).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forgetting_a_host_deletes_all_its_rows() {
+        let path = temp_db("forget");
+        let store = Store::open(&path).unwrap();
+        let mut db = Connection::open(&path).unwrap();
+        let t0 = 200 * 60_000;
+        let batch: Vec<_> = ["a", "b"]
+            .iter()
+            .flat_map(|h| (0..5).map(move |i| (h.to_string(), at(t0 + i * 1000, 1.0))))
+            .collect();
+        write(&mut db, &batch, &[], t0 + 61_000, false).unwrap(); // rolls up a minute
+        write(&mut db, &[], &["a".to_string()], t0 + 62_000, false).unwrap();
+        assert!(store.recent("a", 10).unwrap().is_empty());
+        assert!(
+            store
+                .history("a", Range::Day, t0 + 62_000)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.recent("b", 10).unwrap().len(),
+            5,
+            "other hosts untouched"
+        );
+        assert_eq!(
+            store.history("b", Range::Day, t0 + 62_000).unwrap().len(),
+            1
+        );
         let _ = std::fs::remove_file(&path);
     }
 

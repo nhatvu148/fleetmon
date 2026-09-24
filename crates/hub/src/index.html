@@ -449,7 +449,7 @@ function procTable(rows) {
 // Series for the main chart, from the live window or a fetched range.
 function chartSpec(h, res, points) {
   const s1 = css('--s1'), s2 = css('--s2'), i = h.info;
-  const base = { times: points.map(p => p.ts_ms), span: RANGES[view.range], end: Date.now() };
+  const base = { times: points.map(p => p.ts_ms), span: view.range === '5m' ? liveSpan(h) : RANGES[view.range], end: Date.now() };
   switch (res) {
     case 'cpu': return { ...base, max: 100, fmt: v => v.toFixed(0) + '%', series: [{ label: 'CPU', color: s1, values: points.map(p => p.cpu_pct) }] };
     case 'mem': return { ...base, max: 100, fmt: v => v.toFixed(0) + '%', series: [{ label: 'in use', color: s2, values: points.map(p => memPct(p, i)) }] };
@@ -462,6 +462,16 @@ function chartSpec(h, res, points) {
     case 'temp': return { ...base, max: 110, fmt: v => v.toFixed(0) + ' °C', series: [{ label: 'hottest sensor', color: s2, values: points.map(p => p.temp_max_c ?? null) }] };
   }
   return null;
+}
+
+// The live window is `--history` samples at the agent's interval; both are
+// configurable, so its span is measured from the data rather than assumed.
+function liveSpan(h) {
+  const t = h.history.map(s => s.ts_ms), steps = [];
+  for (let i = 1; i < t.length; i++) steps.push(t[i] - t[i - 1]);
+  if (!steps.length) return RANGES['5m'];
+  const step = steps.sort((a, b) => a - b)[Math.floor(steps.length / 2)];
+  return Math.max(60e3, step * limit);
 }
 
 let fetchSeq = 0;
@@ -570,7 +580,7 @@ function renderDetail({ refetch = false } = {}) {
     el('span', { class: 'dot' + (h.online ? '' : ' off') }), el('h2', {}, i.name),
     el('span', { class: 'muted' }, h.online ? i.os : 'offline'),
     el('div', { class: 'ranges', role: 'group', 'aria-label': 'Time range' }, Object.keys(RANGES).map(r =>
-      el('button', { type: 'button', 'aria-pressed': String(r === view.range), onclick: () => go(i.name, view.res, r) }, r))));
+      el('button', { type: 'button', 'aria-pressed': String(r === view.range), onclick: () => go(i.name, view.res, r) }, r === '5m' ? 'Live' : r))));
   parts.note.hidden = rich(h) || !h.latest;
   parts.rail.replaceChildren(...RES.filter(r => available(h, r)).map(r => railItem(h, r)));
   renderMain(h);
@@ -607,7 +617,8 @@ setInterval(() => { if (view && view.range !== '5m') { const h = hosts.get(view.
 let overviewQueued = false;
 function touched(name) {
   if (view) { if (view.name === name) renderDetail(); return; }
-  if (location.hash.startsWith('#host/' + encodeURIComponent(name))) { route(); return; }
+  // The exact name segment: a prefix match would let "web" re-route "web2".
+  if ((location.hash.match(/^#host\/([^/]+)/) || [])[1] === encodeURIComponent(name)) { route(); return; }
   // Several hosts report each second; redraw the table once per frame.
   if (!overviewQueued) { overviewQueued = true; requestAnimationFrame(() => { overviewQueued = false; if (!view) renderOverview(); }); }
 }

@@ -178,6 +178,9 @@ impl Hub {
                 return Err(Refused::Full);
             };
             state.hosts.remove(&stale);
+            if let Some(store) = &self.0.cfg.store {
+                store.forget(&stale);
+            }
             let _ = self.0.events.send(UiMsg::Removed { host: stale });
         }
         state.next_conn += 1;
@@ -311,6 +314,10 @@ struct HistoryQuery {
 /// `5m` is the live window from memory; `1h`, `24h`, `7d` and `30d` come from
 /// the store, averaged to at most [`store::POINTS`] points.
 async fn api_history(State(hub): State<Hub>, Query(q): Query<HistoryQuery>) -> Response {
+    // Unknown host: 404 for every range, not an empty 200 from the store.
+    if !hub.0.state.lock().unwrap().hosts.contains_key(&q.host) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if q.range == "5m" {
         let state = hub.0.state.lock().unwrap();
         return match state.hosts.get(&q.host) {
@@ -380,18 +387,6 @@ async fn agent_session(hub: Hub, mut socket: WebSocket) {
     };
     let name = info.name.clone();
     tracing::info!(host = %name, os = %info.os, "agent online");
-    let seed = match hub.0.cfg.store.is_some() {
-        true => {
-            let (h, n, k) = (hub.clone(), name.clone(), hub.0.cfg.history);
-            tokio::task::spawn_blocking(move || h.0.cfg.store.as_ref().map(|s| s.recent(&n, k)))
-                .await
-                .ok()
-                .flatten()
-                .and_then(|r| r.map_err(|e| tracing::warn!("reading history: {e:#}")).ok())
-                .unwrap_or_default()
-        }
-        false => Vec::new(),
-    };
     let conn = match hub.hello(info) {
         Ok(conn) => conn,
         Err(why) => {
@@ -405,7 +400,18 @@ async fn agent_session(hub: Hub, mut socket: WebSocket) {
             return;
         }
     };
-    hub.seed(&name, conn, seed);
+    // Only after the hello is accepted: a refused agent costs no history read.
+    if hub.0.cfg.store.is_some() {
+        let (h, n, k) = (hub.clone(), name.clone(), hub.0.cfg.history);
+        let seed =
+            tokio::task::spawn_blocking(move || h.0.cfg.store.as_ref().map(|s| s.recent(&n, k)))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.map_err(|e| tracing::warn!("reading history: {e:#}")).ok())
+                .unwrap_or_default();
+        hub.seed(&name, conn, seed);
+    }
 
     loop {
         match tokio::time::timeout(AGENT_SILENCE, next_msg(&mut socket)).await {

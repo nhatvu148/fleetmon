@@ -40,6 +40,7 @@ pub struct Sampler {
     nets: Networks,
     disks: Disks,
     sensors: Components,
+    live_sensors: LiveSensors,
     last: Instant,
     top: usize,
     ticks: u64,
@@ -74,6 +75,7 @@ impl Sampler {
             nets: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
             sensors: Components::new_with_refreshed_list(),
+            live_sensors: LiveSensors::default(),
             last: Instant::now(),
             top,
             ticks: 0,
@@ -279,15 +281,23 @@ impl Sampler {
         self.slow.space = space;
 
         self.sensors.refresh(true);
+        let live = &mut self.live_sensors;
+        live.begin_round();
+        // Keyed by label plus which occurrence of that label it is — not by list
+        // position, which shifts whenever an unrelated sensor comes or goes.
+        let mut occurrence: std::collections::HashMap<&str, usize> = Default::default();
         let mut temps: Vec<Temp> = self
             .sensors
             .list()
             .iter()
-            // Apple Silicon exposes "PMU tcal", a fixed calibration constant, not a
-            // temperature; it would otherwise sit at the top of the list forever.
-            .filter(|c| !c.label().contains("tcal"))
             .filter_map(|c| {
+                let n = occurrence.entry(c.label()).or_default();
+                *n += 1;
+                let key = format!("{}#{}", c.label(), n);
                 let celsius = c.temperature().filter(|t| t.is_finite() && *t > 0.0)?;
+                if !live.observe(&key, celsius) {
+                    return None;
+                }
                 Some(Temp {
                     label: c.label().to_string(),
                     celsius,
@@ -295,9 +305,49 @@ impl Sampler {
                 })
             })
             .collect();
+        live.end_round();
         temps.sort_by(|a, b| b.celsius.total_cmp(&a.celsius));
         temps.truncate(MAX_TEMPS);
         self.slow.temps = temps;
+    }
+}
+
+/// Remembers each sensor's first reading and reports a sensor only once it has
+/// moved away from it.
+///
+/// Some "sensors" are constants: Apple Silicon's `PMU tcal` is a calibration
+/// value, and many Windows ACPI thermal zones return a fixed placeholder (a
+/// "Computer" zone reading 360.0 K, i.e. 86.85 °C, on every call). Shown, they
+/// pose as the hottest part of the machine. A real sensor changes within
+/// seconds; one that holds perfectly still would stay hidden, which is the
+/// accepted cost of never showing a fake reading.
+#[derive(Default)]
+struct LiveSensors {
+    /// key -> (first reading, has it ever changed)
+    seen: std::collections::HashMap<String, (f32, bool)>,
+    /// Keys observed in the current round, so sensors that vanish are dropped.
+    this_round: std::collections::HashSet<String>,
+}
+
+impl LiveSensors {
+    fn begin_round(&mut self) {
+        self.this_round.clear();
+    }
+
+    /// Forgets sensors not seen this round (hot-removed hardware), so the map
+    /// cannot grow for the life of the agent.
+    fn end_round(&mut self) {
+        let round = &self.this_round;
+        self.seen.retain(|k, _| round.contains(k));
+    }
+
+    fn observe(&mut self, key: &str, celsius: f32) -> bool {
+        self.this_round.insert(key.to_string());
+        let (first, live) = self.seen.entry(key.to_string()).or_insert((celsius, false));
+        if celsius != *first {
+            *live = true;
+        }
+        *live
     }
 }
 
@@ -413,6 +463,36 @@ async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sensor_is_shown_only_once_it_has_changed() {
+        let mut live = LiveSensors::default();
+        // A placeholder: the same value forever, never shown.
+        for _ in 0..100 {
+            assert!(!live.observe("0:Computer", 86.85));
+        }
+        // A real sensor: hidden on its first reading, shown from its first
+        // change on — including if it later returns to the first value.
+        assert!(!live.observe("1:tdie", 44.1));
+        assert!(live.observe("1:tdie", 44.3));
+        assert!(live.observe("1:tdie", 44.1));
+        // Keys are independent.
+        assert!(!live.observe("0:Computer", 86.85));
+    }
+
+    #[test]
+    fn vanished_sensors_are_forgotten() {
+        let mut live = LiveSensors::default();
+        live.begin_round();
+        live.observe("a#1", 40.0);
+        live.observe("b#1", 50.0);
+        live.end_round();
+        live.begin_round();
+        live.observe("a#1", 40.5);
+        live.end_round();
+        assert_eq!(live.seen.len(), 1, "b#1 was not seen this round");
+        assert!(live.seen["a#1"].1, "a#1 changed, so it is live");
+    }
 
     #[test]
     fn process_list_is_refreshed_only_every_proc_every_ticks() {

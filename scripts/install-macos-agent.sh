@@ -102,6 +102,9 @@ for f in "$DIR/fleetmon-agent" "$DIR/token" "$PLIST"; do
   if [ -e "$f" ]; then cp -p "$f" "$bak/"; fi
 done
 rollback() {
+  # Best effort, step by step: under `set -e` one failed restore would otherwise
+  # abort before the previous agent is started again.
+  set +e
   echo "install failed; restoring the previous agent" >&2
   if [ -e "$bak/fleetmon-agent" ]; then cp -p "$bak/fleetmon-agent" "$DIR/"; fi
   if [ -e "$bak/token" ]; then cp -p "$bak/token" "$DIR/"; fi

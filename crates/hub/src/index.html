@@ -118,7 +118,8 @@ const status = document.getElementById('status');
 // ---------------------------------------------------------------- formatting
 const GB = 1073741824, MB = 1048576;
 const gb = b => (b / GB).toFixed(1);
-const size = b => b >= 1e12 ? (b / 1099511627776).toFixed(2) + ' TB' : b >= GB ? (b / GB).toFixed(1) + ' GB' : (b / MB).toFixed(0) + ' MB';
+const TB = 1099511627776;
+const size = b => b >= TB ? (b / TB).toFixed(2) + ' TB' : b >= GB ? (b / GB).toFixed(1) + ' GB' : (b / MB).toFixed(0) + ' MB';
 const trim1 = v => v.toFixed(1).replace(/\.0$/, '');
 const rate = b => b >= MB ? trim1(b / MB) + ' MB/s' : b >= 1024 ? (b / 1024).toFixed(0) + ' KB/s' : Math.round(b) + ' B/s';
 const pct = v => (v == null ? '—' : v.toFixed(0) + '%');
@@ -469,7 +470,10 @@ addEventListener('resize', () => { if (view) renderDetail(); else for (const n o
 
 // ---------------------------------------------------------------- live data
 function touched(name) {
-  if (view) { if (view.name === name) renderDetail(); }
+  if (view) { if (view.name === name) renderDetail(); return; }
+  // A detail URL opened before its host connected (a bookmark, or any page
+  // right after a hub restart) showed "no machine"; open it now that it exists.
+  if (location.hash === '#host/' + encodeURIComponent(name)) route();
   else renderCard(name);
 }
 

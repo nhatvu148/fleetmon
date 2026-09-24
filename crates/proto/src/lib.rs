@@ -120,14 +120,25 @@ impl Sample {
     /// Charts need the scalars over time; lists like disks and processes are
     /// only ever shown for the latest sample, and they are most of the size.
     pub fn slim(&self) -> Sample {
+        // Field by field rather than `..self.clone()`, which would allocate the
+        // very lists this exists to leave out, only to drop them.
         Sample {
-            top: Vec::new(),
-            cpu_cores: Vec::new(),
-            top_mem: Vec::new(),
-            disks: Vec::new(),
-            ifaces: Vec::new(),
-            temps: Vec::new(),
-            ..self.clone()
+            ts_ms: self.ts_ms,
+            cpu_pct: self.cpu_pct,
+            mem_used: self.mem_used,
+            swap_used: self.swap_used,
+            swap_total: self.swap_total,
+            net_rx_bps: self.net_rx_bps,
+            net_tx_bps: self.net_tx_bps,
+            uptime_s: self.uptime_s,
+            cpu_freq_mhz: self.cpu_freq_mhz,
+            load_avg: self.load_avg,
+            mem_available: self.mem_available,
+            disk_read_bps: self.disk_read_bps,
+            disk_write_bps: self.disk_write_bps,
+            temp_max_c: self.temp_max_c,
+            proc_count: self.proc_count,
+            ..Default::default()
         }
     }
 }

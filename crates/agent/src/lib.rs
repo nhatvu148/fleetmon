@@ -166,19 +166,24 @@ impl Sampler {
         let (disk_read_bps, disk_write_bps) = io
             .values()
             .fold((0, 0), |(r, w), (dr, dw)| (r + dr, w + dw));
+        // Built from `space`, which is sorted largest first, so the first disk is
+        // the main one — the overview card shows only that.
         let disks = self
-            .disks
-            .list()
+            .slow
+            .space
             .iter()
-            .filter_map(|d| {
-                let mount = d.mount_point().to_string_lossy().into_owned();
-                let (_, total, available) = self.slow.space.iter().find(|s| s.0 == mount)?;
-                let (read_bps, write_bps) = io.get(&mount).copied().unwrap_or_default();
+            .filter_map(|(mount, total, available)| {
+                let d = self
+                    .disks
+                    .list()
+                    .iter()
+                    .find(|d| d.mount_point().to_string_lossy() == *mount)?;
+                let (read_bps, write_bps) = io.get(mount).copied().unwrap_or_default();
                 Some(DiskInfo {
                     name: d.name().to_string_lossy().into_owned(),
                     fs: d.file_system().to_string_lossy().into_owned(),
                     kind: d.kind().to_string(),
-                    mount,
+                    mount: mount.clone(),
                     total: *total,
                     available: *available,
                     read_bps,
@@ -438,6 +443,10 @@ mod tests {
         // A container may have no real disk at all (overlay is filtered out), so
         // only the invariants are checked, not that a disk exists.
         assert!(r.disks.iter().all(|d| d.available <= d.total));
+        assert!(
+            r.disks.windows(2).all(|w| w[0].total >= w[1].total),
+            "largest disk first"
+        );
         assert!(r.proc_count > 0);
         assert!(r.top_mem.windows(2).all(|w| w[0].mem >= w[1].mem));
         assert!(

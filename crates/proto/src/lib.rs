@@ -66,7 +66,8 @@ pub struct HostInfo {
 /// One reading of a machine, taken every agent tick.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
-    /// Unix milliseconds, from the agent's clock.
+    /// Unix milliseconds. The agent fills it from its own clock; the hub
+    /// replaces it with its own on arrival, so all hosts share one time axis.
     pub ts_ms: u64,
     /// Whole-machine CPU, 0-100.
     pub cpu_pct: f32,

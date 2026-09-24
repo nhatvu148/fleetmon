@@ -11,9 +11,14 @@ services:
       # in any of them would expose the page.
       FLEETMON_ALLOW: ${FLEETMON_SUBNET:?set FLEETMON_SUBNET}
       FLEETMON_TOKEN_FILE: /run/secrets/fleetmon-token
+      # 1 h of every sample and 31 days of minute averages; about 20 MB for a
+      # handful of machines.
+      FLEETMON_DB: /data/fleetmon.db
     volumes:
       # Created by `task deploy:token`, owned by the image's nonroot uid.
       - ./token:/run/secrets/fleetmon-token:ro
+      # Created by `task deploy:pull`, owned by the same uid.
+      - ./data:/data
     # A few hosts at five minutes of history is a couple of MB. The cap keeps a
     # leak here from starving everything else on a shared box.
     mem_limit: 64m

@@ -26,6 +26,10 @@ struct Args {
     /// room; a new name is refused only if every known host is online.
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=10_000))]
     max_hosts: u64,
+    /// SQLite file for durable history (1 h – 30 d charts). Without it the hub
+    /// keeps only the live window in memory.
+    #[arg(long, env = "FLEETMON_DB")]
+    db: Option<PathBuf>,
 }
 
 /// A bare address means just that host.
@@ -69,6 +73,7 @@ async fn main() -> Result<()> {
         allow: args.allow,
         history: args.history as usize,
         max_hosts: args.max_hosts as usize,
+        store: fleetmon_hub::store::open(args.db.as_deref())?,
     });
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await

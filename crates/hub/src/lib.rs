@@ -4,6 +4,8 @@
 //! State is memory only — the latest few minutes per host. Restarting the hub
 //! loses history, and agents repopulate it within a tick of reconnecting.
 
+pub mod store;
+
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
@@ -14,7 +16,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        ConnectInfo, Request, State,
+        ConnectInfo, Query, Request, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
@@ -49,6 +51,9 @@ pub struct Config {
     /// Distinct host names kept. Together with `history` this bounds the hub's
     /// memory, whatever a token holder sends.
     pub max_hosts: usize,
+    /// Durable history for the 1 h – 30 d ranges. Without it the hub serves
+    /// only the live window it holds in memory.
+    pub store: Option<store::Store>,
 }
 
 #[derive(Clone)]
@@ -141,6 +146,7 @@ impl Hub {
             .route(UI_PATH, get(ui_ws))
             .route(AGENT_PATH, get(agent_ws))
             .route("/api/hosts", get(api_hosts))
+            .route("/api/history", get(api_history))
             .layer(middleware::from_fn_with_state(self.clone(), allowlist))
             .with_state(self.clone())
     }
@@ -172,6 +178,9 @@ impl Hub {
                 return Err(Refused::Full);
             };
             state.hosts.remove(&stale);
+            if let Some(store) = &self.0.cfg.store {
+                store.forget(&stale);
+            }
             let _ = self.0.events.send(UiMsg::Removed { host: stale });
         }
         state.next_conn += 1;
@@ -204,7 +213,14 @@ impl Hub {
         Ok(conn)
     }
 
-    fn sample(&self, name: &str, conn: u64, sample: Sample) {
+    fn sample(&self, name: &str, conn: u64, mut sample: Sample) {
+        // The hub's clock, not the agent's: every machine lines up on one time
+        // axis, and a machine with a wrong clock cannot put rows in the future
+        // (where pruning would never reach them) or before the minute roll-up.
+        sample.ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let mut state = self.0.state.lock().unwrap();
         let Some(e) = state.hosts.get_mut(name).filter(|e| e.conn == conn) else {
             return;
@@ -215,10 +231,30 @@ impl Hub {
         }
         e.history.push_back(sample.slim());
         e.latest = Some(sample.clone());
+        if let Some(store) = &self.0.cfg.store {
+            store.record(name, &sample);
+        }
         let _ = self.0.events.send(UiMsg::Sample {
             host: name.to_string(),
             sample,
         });
+    }
+
+    /// Fills an empty in-memory history from the store — after a hub restart,
+    /// so a reconnecting host's charts continue instead of starting blank.
+    fn seed(&self, name: &str, conn: u64, samples: Vec<Sample>) {
+        let mut state = self.0.state.lock().unwrap();
+        let Some(e) = state.hosts.get_mut(name).filter(|e| e.conn == conn) else {
+            return;
+        };
+        if !e.history.is_empty() || samples.is_empty() {
+            return;
+        }
+        let keep = self.0.cfg.history;
+        e.history = samples.into_iter().rev().take(keep).rev().collect();
+        // Readers learn of it the same way as any change of shape: a snapshot.
+        let hosts = state.views();
+        let _ = self.0.events.send(UiMsg::Snapshot { hosts });
     }
 
     fn gone(&self, name: &str, conn: u64) {
@@ -269,6 +305,63 @@ async fn api_hosts(State(hub): State<Hub>) -> Json<Vec<HostView>> {
     Json(hub.snapshot())
 }
 
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    host: String,
+    range: String,
+}
+
+/// `5m` is the live window from memory; `1h`, `24h`, `7d` and `30d` come from
+/// the store, averaged to at most [`store::POINTS`] points.
+async fn api_history(State(hub): State<Hub>, Query(q): Query<HistoryQuery>) -> Response {
+    // Unknown host: 404 for every range, not an empty 200 from the store.
+    if !hub.0.state.lock().unwrap().hosts.contains_key(&q.host) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if q.range == "5m" {
+        let state = hub.0.state.lock().unwrap();
+        return match state.hosts.get(&q.host) {
+            Some(e) => Json(e.history.iter().cloned().collect::<Vec<_>>()).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    let Some(range) = store::Range::parse(&q.range) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "range must be 5m, 1h, 24h, 7d or 30d",
+        )
+            .into_response();
+    };
+    if hub.0.cfg.store.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            "this hub keeps no history; start it with --db",
+        )
+            .into_response();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let h = hub.clone();
+    match tokio::task::spawn_blocking(move || {
+        h.0.cfg
+            .store
+            .as_ref()
+            .expect("checked above")
+            .history(&q.host, range, now)
+    })
+    .await
+    {
+        Ok(Ok(points)) => Json(points).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!("history query failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 async fn agent_ws(State(hub): State<Hub>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -307,6 +400,18 @@ async fn agent_session(hub: Hub, mut socket: WebSocket) {
             return;
         }
     };
+    // Only after the hello is accepted: a refused agent costs no history read.
+    if hub.0.cfg.store.is_some() {
+        let (h, n, k) = (hub.clone(), name.clone(), hub.0.cfg.history);
+        let seed =
+            tokio::task::spawn_blocking(move || h.0.cfg.store.as_ref().map(|s| s.recent(&n, k)))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.map_err(|e| tracing::warn!("reading history: {e:#}")).ok())
+                .unwrap_or_default();
+        hub.seed(&name, conn, seed);
+    }
 
     loop {
         match tokio::time::timeout(AGENT_SILENCE, next_msg(&mut socket)).await {
@@ -424,14 +529,18 @@ mod tests {
                 allow: vec![],
                 history: 3,
                 max_hosts,
+                store: None,
             },
             capacity,
         )
     }
 
-    fn reading(ts_ms: u64) -> Sample {
+    /// `n` travels in `proc_count` as well: the hub restamps `ts_ms` with its
+    /// own clock, so tests that need to tell samples apart use this instead.
+    fn reading(n: u64) -> Sample {
         Sample {
-            ts_ms,
+            ts_ms: n,
+            proc_count: n as u32,
             ..Default::default()
         }
     }
@@ -468,14 +577,14 @@ mod tests {
         }
         match next_event(&hub, &mut rx).await.unwrap() {
             UiMsg::Snapshot { hosts } => {
-                let ts: Vec<_> = hosts[0].history.iter().map(|s| s.ts_ms).collect();
-                assert_eq!(ts, [3, 4, 5]);
+                let ids: Vec<_> = hosts[0].history.iter().map(|s| s.proc_count).collect();
+                assert_eq!(ids, [3, 4, 5]);
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
         hub.sample("a", conn, reading(6));
         match next_event(&hub, &mut rx).await.unwrap() {
-            UiMsg::Sample { sample, .. } => assert_eq!(sample.ts_ms, 6),
+            UiMsg::Sample { sample, .. } => assert_eq!(sample.proc_count, 6),
             other => panic!("expected sample, got {other:?}"),
         }
         assert!(rx.try_recv().is_err());
@@ -545,6 +654,20 @@ mod tests {
     }
 
     #[test]
+    fn samples_are_stamped_with_the_hubs_clock() {
+        let hub = hub(8);
+        let conn = hub.hello(info("a")).unwrap();
+        // An agent whose clock is a year ahead.
+        hub.sample("a", conn, reading(u64::MAX / 2));
+        let ts = hub.snapshot()[0].history[0].ts_ms;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(now.abs_diff(ts) < 5_000, "stamped {ts}, now {now}");
+    }
+
+    #[test]
     fn history_is_slim_and_latest_is_full() {
         let hub = hub(8);
         let conn = hub.hello(info("a")).unwrap();
@@ -562,7 +685,9 @@ mod tests {
         hub.sample("a", conn, full.clone());
         let view = &hub.snapshot()[0];
         assert!(view.history[0].top_mem.is_empty() && view.history[0].cpu_cores.is_empty());
-        assert_eq!(view.latest.as_ref(), Some(&full));
+        let latest = view.latest.as_ref().unwrap();
+        assert_eq!(latest.top_mem, full.top_mem);
+        assert_eq!(latest.cpu_cores, full.cpu_cores);
     }
 
     #[test]

@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>fleetmon</title>
 <link rel="icon" href="data:,">
+<script>
+  // Before first paint: the saved theme, else light.
+  try { if (localStorage.getItem('fleetmon.theme') === 'dark') document.documentElement.dataset.theme = 'dark'; } catch {}
+</script>
 <style>
   :root {
     color-scheme: light;
@@ -14,13 +18,14 @@
     --s1: #2a78d6; --s2: #eb6834;
     --ok: #0ca30c; --warn: #b87800; --hot: #d93b3b; --off: #9ca3af;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      color-scheme: dark;
-      --bg: #0e1014; --card: #161920; --inset: #1d2129; --hover: #1b1f27; --fg: #e6e8eb; --muted: #8b93a1; --line: #252a33;
-      --s1: #3987e5; --s2: #d95926;
-      --ok: #0ca30c; --warn: #fab219; --hot: #f16b6b; --off: #4b5563;
-    }
+  /* Light unless the viewer picks dark with the header toggle; the OS setting
+     is deliberately not followed. The choice is stamped on <html> before first
+     paint (see the script in <head>), so there is no flash of the wrong theme. */
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0e1014; --card: #161920; --inset: #1d2129; --hover: #1b1f27; --fg: #e6e8eb; --muted: #8b93a1; --line: #252a33;
+    --s1: #3987e5; --s2: #d95926;
+    --ok: #0ca30c; --warn: #fab219; --hot: #f16b6b; --off: #4b5563;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
@@ -30,6 +35,8 @@
   h1 { font-size: 18px; margin: 0; }
   h1 a { text-decoration: none; }
   #status { color: var(--muted); font-size: 12px; }
+  #theme { margin-left: auto; border: 1px solid var(--line); background: var(--card); border-radius: 8px; width: 34px; height: 30px; cursor: pointer; font-size: 15px; line-height: 1; align-self: center; }
+  #theme:hover { background: var(--hover); }
   .num { font-variant-numeric: tabular-nums; }
   .muted { color: var(--muted); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
@@ -123,7 +130,7 @@
 </style>
 </head>
 <body>
-<header><h1><a href="#">fleetmon</a></h1><span id="status">connecting…</span></header>
+<header><h1><a href="#">fleetmon</a></h1><span id="status">connecting…</span><button id="theme" type="button"></button></header>
 <main id="overview"></main>
 <main id="detail" hidden></main>
 <script>
@@ -144,7 +151,26 @@ const pct = v => (v == null || isNaN(v) ? '—' : v.toFixed(0) + '%');
 const dur = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const level = (v, warn, hot) => v == null ? '' : v >= hot ? 'hot' : v >= warn ? 'warn' : '';
-const dark = () => matchMedia('(prefers-color-scheme: dark)').matches;
+const dark = () => document.documentElement.dataset.theme === 'dark';
+
+// ---------------------------------------------------------------- theme
+const themeBtn = document.getElementById('theme');
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  themeBtn.textContent = t === 'dark' ? '☀' : '☾';
+  themeBtn.setAttribute('aria-label', t === 'dark' ? 'Switch to light theme' : 'Switch to dark theme');
+  themeBtn.title = themeBtn.getAttribute('aria-label');
+}
+applyTheme(dark() ? 'dark' : 'light');
+themeBtn.addEventListener('click', () => {
+  const t = dark() ? 'light' : 'dark';
+  applyTheme(t);
+  try { localStorage.setItem('fleetmon.theme', t); } catch {}
+  // Canvases read the colour tokens when they draw, so redraw with the new ones.
+  // A stored range's chart holds its colours in its spec, so rebuild it (the
+  // data comes from the cache, not the network).
+  if (view) renderDetail({ refetch: true }); else renderOverview();
+});
 
 // Status levels never rely on colour alone: the flag carries a symbol and a title.
 const flag = (lv, what) => lv ? el('span', { class: 'flag ' + lv, title: `${what} ${lv === 'hot' ? 'critical' : 'high'}` }, lv === 'hot' ? '▲▲' : '▲') : null;

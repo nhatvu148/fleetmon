@@ -210,7 +210,14 @@ impl Hub {
         Ok(conn)
     }
 
-    fn sample(&self, name: &str, conn: u64, sample: Sample) {
+    fn sample(&self, name: &str, conn: u64, mut sample: Sample) {
+        // The hub's clock, not the agent's: every machine lines up on one time
+        // axis, and a machine with a wrong clock cannot put rows in the future
+        // (where pruning would never reach them) or before the minute roll-up.
+        sample.ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let mut state = self.0.state.lock().unwrap();
         let Some(e) = state.hosts.get_mut(name).filter(|e| e.conn == conn) else {
             return;
@@ -522,9 +529,12 @@ mod tests {
         )
     }
 
-    fn reading(ts_ms: u64) -> Sample {
+    /// `n` travels in `proc_count` as well: the hub restamps `ts_ms` with its
+    /// own clock, so tests that need to tell samples apart use this instead.
+    fn reading(n: u64) -> Sample {
         Sample {
-            ts_ms,
+            ts_ms: n,
+            proc_count: n as u32,
             ..Default::default()
         }
     }
@@ -561,14 +571,14 @@ mod tests {
         }
         match next_event(&hub, &mut rx).await.unwrap() {
             UiMsg::Snapshot { hosts } => {
-                let ts: Vec<_> = hosts[0].history.iter().map(|s| s.ts_ms).collect();
-                assert_eq!(ts, [3, 4, 5]);
+                let ids: Vec<_> = hosts[0].history.iter().map(|s| s.proc_count).collect();
+                assert_eq!(ids, [3, 4, 5]);
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
         hub.sample("a", conn, reading(6));
         match next_event(&hub, &mut rx).await.unwrap() {
-            UiMsg::Sample { sample, .. } => assert_eq!(sample.ts_ms, 6),
+            UiMsg::Sample { sample, .. } => assert_eq!(sample.proc_count, 6),
             other => panic!("expected sample, got {other:?}"),
         }
         assert!(rx.try_recv().is_err());
@@ -638,6 +648,20 @@ mod tests {
     }
 
     #[test]
+    fn samples_are_stamped_with_the_hubs_clock() {
+        let hub = hub(8);
+        let conn = hub.hello(info("a")).unwrap();
+        // An agent whose clock is a year ahead.
+        hub.sample("a", conn, reading(u64::MAX / 2));
+        let ts = hub.snapshot()[0].history[0].ts_ms;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(now.abs_diff(ts) < 5_000, "stamped {ts}, now {now}");
+    }
+
+    #[test]
     fn history_is_slim_and_latest_is_full() {
         let hub = hub(8);
         let conn = hub.hello(info("a")).unwrap();
@@ -655,7 +679,9 @@ mod tests {
         hub.sample("a", conn, full.clone());
         let view = &hub.snapshot()[0];
         assert!(view.history[0].top_mem.is_empty() && view.history[0].cpu_cores.is_empty());
-        assert_eq!(view.latest.as_ref(), Some(&full));
+        let latest = view.latest.as_ref().unwrap();
+        assert_eq!(latest.top_mem, full.top_mem);
+        assert_eq!(latest.cpu_cores, full.cpu_cores);
     }
 
     #[test]

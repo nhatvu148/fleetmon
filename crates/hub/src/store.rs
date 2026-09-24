@@ -25,6 +25,10 @@ const RAW_KEEP: Duration = Duration::from_secs(2 * 3600);
 const MINUTE_KEEP: Duration = Duration::from_secs(31 * 86400);
 /// Points a range query returns at most: about one per two pixels of a chart.
 pub const POINTS: i64 = 360;
+/// Samples waiting for the writer, at most. A few machines produce a few per
+/// second, so this is minutes of slack if the disk stalls — and a hard bound
+/// on memory if an agent floods, instead of growing until the hub is killed.
+const QUEUE: usize = 20_000;
 
 /// The columns stored per sample, in one place so every query agrees.
 const COLS: &str = "ts, cpu_pct, mem_used, swap_used, swap_total, net_rx_bps, net_tx_bps, \
@@ -103,8 +107,9 @@ impl Range {
 }
 
 pub struct Store {
-    writes: Mutex<mpsc::Sender<(String, Sample)>>,
+    writes: mpsc::SyncSender<(String, Sample)>,
     reader: Mutex<Connection>,
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -118,23 +123,32 @@ impl Store {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
         std::thread::Builder::new()
             .name("fleetmon-store".into())
             .spawn(move || write_loop(writer, rx))?;
         Ok(Store {
-            writes: Mutex::new(tx),
+            writes: tx,
             reader: Mutex::new(reader),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
-    /// Queues a sample for writing. Never blocks on disk.
+    /// Queues a sample for writing. Never blocks: when the queue is full the
+    /// sample is dropped from history (it is still shown live) and counted.
     pub fn record(&self, host: &str, sample: &Sample) {
-        let _ = self
+        use std::sync::atomic::Ordering;
+        if self
             .writes
-            .lock()
-            .unwrap()
-            .send((host.to_string(), sample.slim()));
+            .try_send((host.to_string(), sample.slim()))
+            .is_err()
+        {
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // First drop, then one line per thousand: enough to notice.
+            if n == 1 || n.is_multiple_of(1000) {
+                tracing::warn!(dropped = n, "history queue full; samples not stored");
+            }
+        }
     }
 
     /// The newest `n` samples for a host, oldest first. Blocking.

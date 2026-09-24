@@ -4,6 +4,8 @@
 //! State is memory only — the latest few minutes per host. Restarting the hub
 //! loses history, and agents repopulate it within a tick of reconnecting.
 
+pub mod store;
+
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
@@ -14,7 +16,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        ConnectInfo, Request, State,
+        ConnectInfo, Query, Request, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
@@ -49,6 +51,9 @@ pub struct Config {
     /// Distinct host names kept. Together with `history` this bounds the hub's
     /// memory, whatever a token holder sends.
     pub max_hosts: usize,
+    /// Durable history for the 1 h – 30 d ranges. Without it the hub serves
+    /// only the live window it holds in memory.
+    pub store: Option<store::Store>,
 }
 
 #[derive(Clone)]
@@ -141,6 +146,7 @@ impl Hub {
             .route(UI_PATH, get(ui_ws))
             .route(AGENT_PATH, get(agent_ws))
             .route("/api/hosts", get(api_hosts))
+            .route("/api/history", get(api_history))
             .layer(middleware::from_fn_with_state(self.clone(), allowlist))
             .with_state(self.clone())
     }
@@ -215,10 +221,30 @@ impl Hub {
         }
         e.history.push_back(sample.slim());
         e.latest = Some(sample.clone());
+        if let Some(store) = &self.0.cfg.store {
+            store.record(name, &sample);
+        }
         let _ = self.0.events.send(UiMsg::Sample {
             host: name.to_string(),
             sample,
         });
+    }
+
+    /// Fills an empty in-memory history from the store — after a hub restart,
+    /// so a reconnecting host's charts continue instead of starting blank.
+    fn seed(&self, name: &str, conn: u64, samples: Vec<Sample>) {
+        let mut state = self.0.state.lock().unwrap();
+        let Some(e) = state.hosts.get_mut(name).filter(|e| e.conn == conn) else {
+            return;
+        };
+        if !e.history.is_empty() || samples.is_empty() {
+            return;
+        }
+        let keep = self.0.cfg.history;
+        e.history = samples.into_iter().rev().take(keep).rev().collect();
+        // Readers learn of it the same way as any change of shape: a snapshot.
+        let hosts = state.views();
+        let _ = self.0.events.send(UiMsg::Snapshot { hosts });
     }
 
     fn gone(&self, name: &str, conn: u64) {
@@ -269,6 +295,59 @@ async fn api_hosts(State(hub): State<Hub>) -> Json<Vec<HostView>> {
     Json(hub.snapshot())
 }
 
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    host: String,
+    range: String,
+}
+
+/// `5m` is the live window from memory; `1h`, `24h`, `7d` and `30d` come from
+/// the store, averaged to at most [`store::POINTS`] points.
+async fn api_history(State(hub): State<Hub>, Query(q): Query<HistoryQuery>) -> Response {
+    if q.range == "5m" {
+        let state = hub.0.state.lock().unwrap();
+        return match state.hosts.get(&q.host) {
+            Some(e) => Json(e.history.iter().cloned().collect::<Vec<_>>()).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
+    let Some(range) = store::Range::parse(&q.range) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "range must be 5m, 1h, 24h, 7d or 30d",
+        )
+            .into_response();
+    };
+    if hub.0.cfg.store.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            "this hub keeps no history; start it with --db",
+        )
+            .into_response();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let h = hub.clone();
+    match tokio::task::spawn_blocking(move || {
+        h.0.cfg
+            .store
+            .as_ref()
+            .expect("checked above")
+            .history(&q.host, range, now)
+    })
+    .await
+    {
+        Ok(Ok(points)) => Json(points).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!("history query failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 async fn agent_ws(State(hub): State<Hub>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -294,6 +373,18 @@ async fn agent_session(hub: Hub, mut socket: WebSocket) {
     };
     let name = info.name.clone();
     tracing::info!(host = %name, os = %info.os, "agent online");
+    let seed = match hub.0.cfg.store.is_some() {
+        true => {
+            let (h, n, k) = (hub.clone(), name.clone(), hub.0.cfg.history);
+            tokio::task::spawn_blocking(move || h.0.cfg.store.as_ref().map(|s| s.recent(&n, k)))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.map_err(|e| tracing::warn!("reading history: {e:#}")).ok())
+                .unwrap_or_default()
+        }
+        false => Vec::new(),
+    };
     let conn = match hub.hello(info) {
         Ok(conn) => conn,
         Err(why) => {
@@ -307,6 +398,7 @@ async fn agent_session(hub: Hub, mut socket: WebSocket) {
             return;
         }
     };
+    hub.seed(&name, conn, seed);
 
     loop {
         match tokio::time::timeout(AGENT_SILENCE, next_msg(&mut socket)).await {
@@ -424,6 +516,7 @@ mod tests {
                 allow: vec![],
                 history: 3,
                 max_hosts,
+                store: None,
             },
             capacity,
         )

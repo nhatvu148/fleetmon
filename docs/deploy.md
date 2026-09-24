@@ -10,8 +10,9 @@ The network is deliberately not the proxy's shared one. There, every other app's
 2. DNS: a proxied record for the domain pointing at the box.
 3. `task deploy:token` — creates the agent token on the server, owned by the container's user, never printed.
 4. `task deploy` once, which creates the `fleetmon` network.
-5. Join the reverse proxy to it — live with `docker network connect fleetmon <proxy-container>`, and persistently by adding it to the proxy's compose file as an external network.
-6. Add a server block to the reverse proxy (below) and reload it.
+5. `data/` next to the compose file holds the history database (created by `task deploy:pull`, owned by the container's user). Back it up if a month of history matters to you; the hub rebuilds nothing from it.
+6. Join the reverse proxy to it — live with `docker network connect fleetmon <proxy-container>`, and persistently by adding it to the proxy's compose file as an external network.
+7. Add a server block to the reverse proxy (below) and reload it.
 
 ## Each release
 

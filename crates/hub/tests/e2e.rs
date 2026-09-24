@@ -19,6 +19,7 @@ async fn start_hub() -> SocketAddr {
         allow: vec![],
         history: 10,
         max_hosts: 8,
+        store: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -128,6 +129,89 @@ async fn refused_hello_says_why() {
         }
         other => panic!("expected a close frame, got {other:?}"),
     }
+}
+
+async fn start_hub_with_db(db: &std::path::Path) -> SocketAddr {
+    let hub = Hub::new(Config {
+        token: TOKEN.into(),
+        allow: vec![],
+        history: 300,
+        max_hosts: 8,
+        store: Some(fleetmon_hub::store::Store::open(db).unwrap()),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            hub.router()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
+fn agent(addr: SocketAddr) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(fleetmon_agent::run(fleetmon_agent::Config {
+        hub: format!("ws://{addr}"),
+        token: TOKEN.into(),
+        name: "hist".into(),
+        interval: Duration::from_millis(250),
+        top: 3,
+    }))
+}
+
+#[tokio::test]
+async fn history_is_stored_served_and_survives_a_hub_restart() {
+    let db = std::env::temp_dir().join(format!("fleetmon-e2e-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+
+    let addr = start_hub_with_db(&db).await;
+    let a = agent(addr);
+    // Samples every 250 ms; the store's writer flushes about once a second.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    a.abort();
+
+    let hour = get(addr, "/api/history?host=hist&range=1h").await;
+    assert!(hour.contains("\"cpu_pct\""), "{hour}");
+    let live = get(addr, "/api/history?host=hist&range=5m").await;
+    assert!(live.contains("\"cpu_pct\""), "{live}");
+    assert!(
+        get_status(addr, "/api/history?host=hist&range=2y")
+            .await
+            .starts_with("HTTP/1.1 400")
+    );
+
+    // A new hub on the same file: the reconnecting host's live window is
+    // reloaded, so the page's charts continue across a restart.
+    let addr2 = start_hub_with_db(&db).await;
+    let (mut ui, _) = tokio_tungstenite::connect_async(format!("ws://{addr2}/ws"))
+        .await
+        .unwrap();
+    assert_eq!(next_ui(&mut ui).await, UiMsg::Snapshot { hosts: vec![] });
+    let a2 = agent(addr2);
+    let restored = loop {
+        if let UiMsg::Snapshot { hosts } = next_ui(&mut ui).await {
+            break hosts[0].history.len();
+        }
+    };
+    a2.abort();
+    assert!(restored >= 3, "only {restored} samples came back");
+    let _ = std::fs::remove_file(&db);
+}
+
+async fn get_status(addr: SocketAddr, path: &str) -> String {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    out
 }
 
 /// Minimal HTTP GET, to avoid a client dependency for two assertions.

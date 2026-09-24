@@ -91,7 +91,9 @@ tasks:
     desc: Ship the compose file and pull the image from GHCR
     deps: [deploy:preflight]
     cmds:
-      - ssh root@{{.DEPLOY_SERVER}} 'mkdir -p {{.DEPLOY_DIR}}'
+      # data/ holds the history database and must be writable by the image's
+      # nonroot user; the container cannot chown it itself.
+      - ssh root@{{.DEPLOY_SERVER}} 'mkdir -p {{.DEPLOY_DIR}}/data && chown {{.NONROOT_UID}}:{{.NONROOT_UID}} {{.DEPLOY_DIR}}/data'
       - scp docker/docker-compose.prod.yml root@{{.DEPLOY_SERVER}}:{{.DEPLOY_DIR}}/
       - ssh root@{{.DEPLOY_SERVER}} 'cd {{.DEPLOY_DIR}} && FLEETMON_SUBNET={{.FLEETMON_SUBNET}} docker compose -f docker-compose.prod.yml pull'
 

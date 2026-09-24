@@ -13,7 +13,7 @@ Built for the "few boxes I own" case — a laptop, a desktop, a cloud VM — whe
 ## Design choices
 
 - **Agents only dial out.** An agent never listens on a port, so on a shared network a monitored box exposes nothing new. Where the agent cannot reach the hub directly, a reverse SSH tunnel (`ssh -R 7070:127.0.0.1:7070 box`) lets it dial `127.0.0.1` instead.
-- **One hub, memory only.** The last `--history` samples per host (five minutes by default). No database, no cluster, no broker. Restarting the hub loses history, and agents refill it within a second of reconnecting.
+- **One hub, one file.** Live data is held in memory; with `--db`, every sample also goes to SQLite (compiled in, no server): each second for 2 hours, then one average per minute for 31 days, which feeds the 1 h / 24 h / 7 d / 30 d charts. After a restart a reconnecting machine's recent history is reloaded, so charts continue. Without `--db` the hub keeps only the live window.
 - **Two gates.** Agents present a bearer token. Every route — the page included, since it shows process names — is limited to loopback plus an `--allow` list of IPs or CIDRs.
 - **No secrets on command lines.** Tokens come from a file (`--token-file`) or `FLEETMON_TOKEN`, never a flag, because a command line is visible to every user on the box.
 - **No frontend build.** The page is one HTML file compiled into the hub binary, with hand-drawn canvas sparklines and no dependencies, so it works on a machine with no internet access.
@@ -54,6 +54,7 @@ To run the hub on a server behind a reverse proxy and TLS, see [docs/deploy.md](
 | `--token-file` | `FLEETMON_TOKEN_FILE` | | or `FLEETMON_TOKEN`; at least 16 characters |
 | `--history` | | `300` | samples kept per host |
 | `--max-hosts` | | `64` | distinct hosts kept; when full, an offline host is forgotten to make room |
+| `--db` | `FLEETMON_DB` | *(none)* | SQLite file for history; enables the 1 h – 30 d ranges |
 
 | Agent | Env | Default | |
 |---|---|---|---|

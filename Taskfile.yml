@@ -67,7 +67,10 @@ tasks:
     vars:
       OUT: '{{.OUT | default "fleetmon.token"}}'
     cmds:
-      - (umask 077 && ssh root@{{.DEPLOY_SERVER}} 'cat {{.DEPLOY_DIR}}/token' > {{.OUT}})
+      # Real bash, because Task's built-in shell has no `umask`. Under umask 077
+      # the file is created 0600 by the same redirection that writes the token,
+      # so there is no window between creating it and restricting it.
+      - bash -c 'umask 077 && ssh "root@$1" "cat $2/token" > "$3"' _ '{{.DEPLOY_SERVER}}' '{{.DEPLOY_DIR}}' '{{.OUT}}'
       - 'echo "token written to {{.OUT}}"'
 
   deploy:pull:

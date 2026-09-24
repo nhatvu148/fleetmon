@@ -37,7 +37,7 @@ pub fn check_name(name: &str) -> Result<(), &'static str> {
 }
 
 /// What a machine is. Sent once per connection, before any sample.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostInfo {
     /// Display name, unique across the fleet. Defaults to the hostname.
     pub name: String,
@@ -48,10 +48,23 @@ pub struct HostInfo {
     pub cores: usize,
     pub mem_total: u64,
     pub agent_version: String,
+    // Everything below arrived after 0.1.0 and defaults when absent, so agents
+    // and hubs of different versions keep talking to each other.
+    /// e.g. "24.6.0" (Darwin), "10.0.26100" (Windows NT).
+    #[serde(default)]
+    pub kernel: String,
+    /// e.g. "arm64", "x86_64".
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub physical_cores: Option<usize>,
+    /// Unix seconds.
+    #[serde(default)]
+    pub boot_time: u64,
 }
 
 /// One reading of a machine, taken every agent tick.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     /// Unix milliseconds, from the agent's clock.
     pub ts_ms: u64,
@@ -67,6 +80,95 @@ pub struct Sample {
     pub uptime_s: u64,
     /// Heaviest processes by CPU, heaviest first.
     pub top: Vec<Proc>,
+    // Added after 0.1.0; see HostInfo.
+    /// Per logical core, 0-100.
+    #[serde(default)]
+    pub cpu_cores: Vec<f32>,
+    /// Mean current clock across cores.
+    #[serde(default)]
+    pub cpu_freq_mhz: u64,
+    /// 1, 5 and 15 minute load average. Not available on Windows.
+    #[serde(default)]
+    pub load_avg: Option<[f64; 3]>,
+    /// Memory an allocation could get without swapping, which on macOS and
+    /// Linux is far more than "free".
+    #[serde(default)]
+    pub mem_available: u64,
+    /// Bytes per second across every disk.
+    #[serde(default)]
+    pub disk_read_bps: u64,
+    #[serde(default)]
+    pub disk_write_bps: u64,
+    /// Hottest sensor, for the history chart. `None` where the OS exposes none.
+    #[serde(default)]
+    pub temp_max_c: Option<f32>,
+    #[serde(default)]
+    pub proc_count: u32,
+    /// Heaviest processes by memory, heaviest first.
+    #[serde(default)]
+    pub top_mem: Vec<Proc>,
+    #[serde(default)]
+    pub disks: Vec<DiskInfo>,
+    #[serde(default)]
+    pub ifaces: Vec<Iface>,
+    #[serde(default)]
+    pub temps: Vec<Temp>,
+}
+
+impl Sample {
+    /// The sample without its per-item lists — what a hub keeps for history.
+    /// Charts need the scalars over time; lists like disks and processes are
+    /// only ever shown for the latest sample, and they are most of the size.
+    pub fn slim(&self) -> Sample {
+        // Field by field rather than `..self.clone()`, which would allocate the
+        // very lists this exists to leave out, only to drop them.
+        Sample {
+            ts_ms: self.ts_ms,
+            cpu_pct: self.cpu_pct,
+            mem_used: self.mem_used,
+            swap_used: self.swap_used,
+            swap_total: self.swap_total,
+            net_rx_bps: self.net_rx_bps,
+            net_tx_bps: self.net_tx_bps,
+            uptime_s: self.uptime_s,
+            cpu_freq_mhz: self.cpu_freq_mhz,
+            load_avg: self.load_avg,
+            mem_available: self.mem_available,
+            disk_read_bps: self.disk_read_bps,
+            disk_write_bps: self.disk_write_bps,
+            temp_max_c: self.temp_max_c,
+            proc_count: self.proc_count,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiskInfo {
+    pub name: String,
+    pub mount: String,
+    pub fs: String,
+    /// "SSD", "HDD" or "Unknown".
+    pub kind: String,
+    pub total: u64,
+    pub available: u64,
+    pub read_bps: u64,
+    pub write_bps: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Iface {
+    pub name: String,
+    pub rx_bps: u64,
+    pub tx_bps: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Temp {
+    pub label: String,
+    pub celsius: f32,
+    #[serde(default)]
+    pub critical: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,8 +194,12 @@ pub enum AgentMsg {
 pub struct HostView {
     pub info: HostInfo,
     pub online: bool,
-    /// Oldest first. Bounded by the hub's history length.
+    /// Oldest first, slimmed (see [`Sample::slim`]). Bounded by the hub's
+    /// history length.
     pub history: Vec<Sample>,
+    /// The most recent sample in full, lists included.
+    #[serde(default)]
+    pub latest: Option<Sample>,
 }
 
 /// Hub → browser (and any other reader of `/ws`).
@@ -141,7 +247,38 @@ mod tests {
                 cpu_pct: 50.0,
                 mem: 9,
             }],
+            cpu_cores: vec![10.0, 15.0],
+            cpu_freq_mhz: 3200,
+            load_avg: Some([1.0, 0.5, 0.25]),
+            mem_available: 1,
+            disk_read_bps: 6,
+            disk_write_bps: 7,
+            temp_max_c: Some(55.0),
+            proc_count: 300,
+            top_mem: vec![],
+            disks: vec![],
+            ifaces: vec![],
+            temps: vec![],
         }
+    }
+
+    #[test]
+    fn a_010_agent_sample_still_parses() {
+        // What a 0.1.0 agent sends: none of the later fields.
+        let old = r#"{"type":"sample","ts_ms":1,"cpu_pct":1.0,"mem_used":2,"swap_used":0,
+            "swap_total":0,"net_rx_bps":0,"net_tx_bps":0,"uptime_s":3,"top":[]}"#;
+        let AgentMsg::Sample(s) = serde_json::from_str(old).unwrap() else {
+            panic!("not a sample")
+        };
+        assert!(s.cpu_cores.is_empty() && s.load_avg.is_none() && s.disks.is_empty());
+    }
+
+    #[test]
+    fn slim_keeps_scalars_and_drops_lists() {
+        let s = sample().slim();
+        assert_eq!(s.cpu_pct, 12.5);
+        assert_eq!(s.temp_max_c, Some(55.0));
+        assert!(s.top.is_empty() && s.cpu_cores.is_empty());
     }
 
     #[test]

@@ -80,7 +80,10 @@ struct Entry {
     /// When the hub last heard from this host, by the hub's clock. Eviction
     /// orders by this, never by the agent's own timestamps.
     last_seen: Instant,
+    /// Slimmed samples: the scalars the charts plot, without per-item lists.
     history: VecDeque<Sample>,
+    /// The newest sample in full, for the detail view.
+    latest: Option<Sample>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -108,6 +111,7 @@ impl HubState {
                 info: e.info.clone(),
                 online: e.online,
                 history: e.history.iter().cloned().collect(),
+                latest: e.latest.clone(),
             })
             .collect();
         views.sort_by(|a, b| a.info.name.cmp(&b.info.name));
@@ -191,6 +195,7 @@ impl Hub {
                         online: true,
                         last_seen: Instant::now(),
                         history: VecDeque::new(),
+                        latest: None,
                     },
                 );
             }
@@ -208,7 +213,8 @@ impl Hub {
         if e.history.len() >= self.0.cfg.history {
             e.history.pop_front();
         }
-        e.history.push_back(sample.clone());
+        e.history.push_back(sample.slim());
+        e.latest = Some(sample.clone());
         let _ = self.0.events.send(UiMsg::Sample {
             host: name.to_string(),
             sample,
@@ -426,14 +432,7 @@ mod tests {
     fn reading(ts_ms: u64) -> Sample {
         Sample {
             ts_ms,
-            cpu_pct: 0.0,
-            mem_used: 0,
-            swap_used: 0,
-            swap_total: 0,
-            net_rx_bps: 0,
-            net_tx_bps: 0,
-            uptime_s: 0,
-            top: vec![],
+            ..Default::default()
         }
     }
 
@@ -490,6 +489,7 @@ mod tests {
             cores: 1,
             mem_total: 1,
             agent_version: "0".into(),
+            ..Default::default()
         }
     }
 
@@ -542,6 +542,27 @@ mod tests {
         hub.sample("a", conn, reading(1));
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::Sample { .. }));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn history_is_slim_and_latest_is_full() {
+        let hub = hub(8);
+        let conn = hub.hello(info("a")).unwrap();
+        let full = Sample {
+            ts_ms: 9,
+            top_mem: vec![fleetmon_proto::Proc {
+                pid: 1,
+                name: "p".into(),
+                cpu_pct: 0.0,
+                mem: 1,
+            }],
+            cpu_cores: vec![1.0, 2.0],
+            ..Default::default()
+        };
+        hub.sample("a", conn, full.clone());
+        let view = &hub.snapshot()[0];
+        assert!(view.history[0].top_mem.is_empty() && view.history[0].cpu_cores.is_empty());
+        assert_eq!(view.latest.as_ref(), Some(&full));
     }
 
     #[test]

@@ -167,9 +167,17 @@ themeBtn.addEventListener('click', () => {
   applyTheme(t);
   try { localStorage.setItem('fleetmon.theme', t); } catch {}
   // Canvases read the colour tokens when they draw, so redraw with the new ones.
-  // A stored range's chart holds its colours in its spec, so rebuild it (the
-  // data comes from the cache, not the network).
-  if (view) renderDetail({ refetch: true }); else renderOverview();
+  // Only canvases need redrawing: everything else follows the CSS tokens by
+  // itself (the overview table has none). The big chart keeps its colours in
+  // its spec, so it is re-specced from the points it already holds — never a
+  // fetch, however old the cached range is.
+  if (!view) return;
+  renderDetail();
+  const h = hosts.get(view.name);
+  if (h && view.points) {
+    const spec = chartSpec(h, view.res, view.points);
+    if (spec) { spec.empty = view.parts.chart.spec?.empty; view.parts.chart.set(spec); }
+  }
 });
 
 // Status levels never rely on colour alone: the flag carries a symbol and a title.
@@ -512,6 +520,7 @@ async function loadChart(h) {
     if (seq !== fetchSeq || view !== v) return; // a newer request won
     if (!hubHasHistory) empty = 'This hub keeps no history — start it with --db';
   }
+  v.points = points; // what the chart shows, for a recolour without refetching
   const spec = chartSpec(h, v.res, points);
   if (!spec) return;
   spec.empty = empty;

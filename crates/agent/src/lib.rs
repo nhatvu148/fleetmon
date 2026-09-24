@@ -40,6 +40,7 @@ pub struct Sampler {
     nets: Networks,
     disks: Disks,
     sensors: Components,
+    live_sensors: LiveSensors,
     last: Instant,
     top: usize,
     ticks: u64,
@@ -74,6 +75,7 @@ impl Sampler {
             nets: Networks::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
             sensors: Components::new_with_refreshed_list(),
+            live_sensors: LiveSensors::default(),
             last: Instant::now(),
             top,
             ticks: 0,
@@ -279,15 +281,18 @@ impl Sampler {
         self.slow.space = space;
 
         self.sensors.refresh(true);
+        let live = &mut self.live_sensors;
         let mut temps: Vec<Temp> = self
             .sensors
             .list()
             .iter()
-            // Apple Silicon exposes "PMU tcal", a fixed calibration constant, not a
-            // temperature; it would otherwise sit at the top of the list forever.
-            .filter(|c| !c.label().contains("tcal"))
-            .filter_map(|c| {
+            .enumerate()
+            .filter_map(|(i, c)| {
                 let celsius = c.temperature().filter(|t| t.is_finite() && *t > 0.0)?;
+                // Labels repeat on some machines, so the position disambiguates.
+                if !live.observe(&format!("{i}:{}", c.label()), celsius) {
+                    return None;
+                }
                 Some(Temp {
                     label: c.label().to_string(),
                     celsius,
@@ -298,6 +303,31 @@ impl Sampler {
         temps.sort_by(|a, b| b.celsius.total_cmp(&a.celsius));
         temps.truncate(MAX_TEMPS);
         self.slow.temps = temps;
+    }
+}
+
+/// Remembers each sensor's first reading and reports a sensor only once it has
+/// moved away from it.
+///
+/// Some "sensors" are constants: Apple Silicon's `PMU tcal` is a calibration
+/// value, and many Windows ACPI thermal zones return a fixed placeholder (a
+/// "Computer" zone reading 360.0 K, i.e. 86.85 °C, on every call). Shown, they
+/// pose as the hottest part of the machine. A real sensor changes within
+/// seconds; one that holds perfectly still would stay hidden, which is the
+/// accepted cost of never showing a fake reading.
+#[derive(Default)]
+struct LiveSensors {
+    /// key -> (first reading, has it ever changed)
+    seen: std::collections::HashMap<String, (f32, bool)>,
+}
+
+impl LiveSensors {
+    fn observe(&mut self, key: &str, celsius: f32) -> bool {
+        let (first, live) = self.seen.entry(key.to_string()).or_insert((celsius, false));
+        if celsius != *first {
+            *live = true;
+        }
+        *live
     }
 }
 
@@ -413,6 +443,22 @@ async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sensor_is_shown_only_once_it_has_changed() {
+        let mut live = LiveSensors::default();
+        // A placeholder: the same value forever, never shown.
+        for _ in 0..100 {
+            assert!(!live.observe("0:Computer", 86.85));
+        }
+        // A real sensor: hidden on its first reading, shown from its first
+        // change on — including if it later returns to the first value.
+        assert!(!live.observe("1:tdie", 44.1));
+        assert!(live.observe("1:tdie", 44.3));
+        assert!(live.observe("1:tdie", 44.1));
+        // Keys are independent.
+        assert!(!live.observe("0:Computer", 86.85));
+    }
 
     #[test]
     fn process_list_is_refreshed_only_every_proc_every_ticks() {
